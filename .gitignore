@@ -1,0 +1,24 @@
+# Virtual environment
+.venv/
+__pycache__/
+*.py[cod]
+
+# Local configuration (copy .env.example instead)
+.env
+
+# Job workspaces and their outputs
+jobs/
+
+# Cached PHP, MariaDB, WordPress and downloads
+runtime/
+
+# Generated test fixture (rebuild with scripts/make_fixture.py)
+tests/fixtures/*.wpress
+
+# Optional external extractor binary
+extractor/*.exe
+extractor/wpress_extractor
+
+.pytest_cache/
+.idea/
+.vscode/

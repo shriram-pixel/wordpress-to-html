@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WordPress to Static HTML</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">&#9635;</span>
+    <div>
+      <h1>WordPress &rarr; Static HTML</h1>
+      <p class="tagline">Restore a <code>.wpress</code> backup locally, render it, export a deployable site.</p>
+    </div>
+  </div>
+  <div id="health" class="health" role="status" aria-live="polite">Checking dependencies&hellip;</div>
+</header>
+
+<main class="layout">
+
+  <!-- ================= new conversion ================= -->
+  <section class="panel" id="new-job-panel">
+    <h2>New conversion</h2>
+
+    <form id="job-form">
+      <div class="source-tabs" role="tablist" aria-label="Where the backup is">
+        <button type="button" role="tab" class="source-tab active" id="tab-local"
+                aria-selected="true">File on this computer</button>
+        <button type="button" role="tab" class="source-tab" id="tab-upload"
+                aria-selected="false">Upload a file</button>
+      </div>
+
+      <div class="local-source" id="local-source">
+        <p class="hint">Converted where it is &mdash; no upload, no copy.</p>
+        <div class="local-list" id="local-list"><p class="muted">Looking for backups&hellip;</p></div>
+        <label class="path-label" for="local-path">Or paste the full path</label>
+        <div class="path-row">
+          <input type="text" id="local-path" placeholder="C:\bkp\site.wpress" spellcheck="false"
+                 autocomplete="off">
+          <button type="button" class="ghost small" id="refresh-local">Rescan</button>
+        </div>
+        <p class="muted small-print" id="local-folders"></p>
+      </div>
+
+      <div class="dropzone" id="dropzone" hidden tabindex="0" role="button"
+           aria-label="Choose a .wpress file or drop one here">
+        <input type="file" id="file-input" accept=".wpress" hidden>
+        <div class="dropzone-inner">
+          <span class="dz-icon" aria-hidden="true">&#8681;</span>
+          <p class="dz-title">Choose a <code>.wpress</code> file</p>
+          <p class="dz-hint">or drop it here</p>
+        </div>
+        <div class="dz-selected" id="dz-selected" hidden>
+          <strong id="dz-name"></strong>
+          <span id="dz-size" class="muted"></span>
+          <button type="button" class="link" id="dz-clear">change</button>
+        </div>
+      </div>
+
+      <p class="hint settings-note">
+        Uses the standard settings: one folder per page, links to folders,
+        pages, posts, custom post types and category archives, with link,
+        JavaScript and screenshot checks. Speed is matched to this computer.
+      </p>
+
+      <button type="submit" class="primary" id="start-btn" disabled>Start conversion</button>
+      <p class="form-error" id="form-error" hidden></p>
+    </form>
+  </section>
+
+  <!-- ================= progress ================= -->
+  <section class="panel" id="progress-panel" hidden>
+    <div class="panel-head">
+      <h2>Progress</h2>
+      <div class="head-actions">
+        <span id="job-status" class="status-pill">QUEUED</span>
+        <button type="button" class="ghost" id="cancel-btn">Cancel</button>
+      </div>
+    </div>
+
+    <div class="overall">
+      <div class="bar"><div class="fill" id="overall-fill"></div></div>
+      <div class="overall-meta">
+        <span id="overall-pct">0%</span>
+        <span id="stage-detail" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="timing" id="timing">
+      <div class="timing-cell"><span class="l">Stage</span><span class="v" id="stage-name">&mdash;</span></div>
+      <div class="timing-cell"><span class="l">Stage time left</span><span class="v" id="stage-eta">&mdash;</span></div>
+      <div class="timing-cell"><span class="l">Job time left</span><span class="v" id="job-eta">&mdash;</span></div>
+      <div class="timing-cell"><span class="l">Elapsed</span><span class="v" id="elapsed">&mdash;</span></div>
+    </div>
+
+    <ol class="stages" id="stages"></ol>
+
+    <div class="counters" id="counters" hidden></div>
+
+    <details class="log-wrap" open>
+      <summary>Activity log</summary>
+      <div class="log" id="log" role="log" aria-live="polite"></div>
+    </details>
+
+    <div class="result" id="result" hidden>
+      <h3 id="result-title">Conversion complete</h3>
+      <p id="result-summary" class="muted"></p>
+      <div class="result-actions">
+        <a class="primary" id="download-link" href="#" download>Download ZIP</a>
+        <a class="ghost" id="report-link" href="#" target="_blank" rel="noopener">View report</a>
+        <a class="ghost" id="log-link" href="#" target="_blank" rel="noopener">View log</a>
+      </div>
+      <div id="limitations" class="limitations" hidden></div>
+    </div>
+  </section>
+
+  <!-- ================= history ================= -->
+  <section class="panel" id="history-panel">
+    <div class="panel-head">
+      <h2>Recent conversions</h2>
+      <button type="button" class="ghost small" id="refresh-history">Refresh</button>
+    </div>
+    <div id="history"><p class="muted">Nothing yet.</p></div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <p>
+    Runs entirely on this machine. The backup is restored into a temporary,
+    loopback-only WordPress that is destroyed when the job finishes.
+  </p>
+</footer>
+
+<script src="/static/app.js"></script>
+</body>
+</html>

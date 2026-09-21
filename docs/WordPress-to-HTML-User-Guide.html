@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WordPress to Static HTML – User Guide</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm 16mm 15mm; }
+  :root { --ink:#1d2330; --muted:#5b6475; --line:#dde2ea; --accent:#1f6feb; --ok:#1a7f37; --no:#b42318; --warn:#9a6700; --soft:#f5f7fb; }
+  * { box-sizing: border-box; }
+  body { font-family: "Segoe UI", Arial, sans-serif; color: var(--ink); font-size: 10.5pt; line-height: 1.5; margin: 0; }
+  h1 { font-size: 24pt; margin: 0 0 4px; letter-spacing: -0.3px; }
+  h2 { font-size: 15pt; margin: 26px 0 8px; padding-bottom: 5px; border-bottom: 2px solid var(--accent); break-after: avoid; }
+  h3 { font-size: 11.5pt; margin: 16px 0 6px; break-after: avoid; }
+  p { margin: 6px 0; }
+  .sub { color: var(--muted); font-size: 11pt; margin-bottom: 14px; }
+  .cover { border-left: 6px solid var(--accent); padding: 6px 0 6px 16px; margin-bottom: 18px; }
+  .box { background: var(--soft); border: 1px solid var(--line); border-radius: 8px; padding: 10px 14px; margin: 10px 0; break-inside: avoid; }
+  .box.warn { background: #fff8e6; border-color: #f0d58a; }
+  .box.good { background: #eef8f1; border-color: #b6e0c2; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0 12px; font-size: 9.8pt; break-inside: auto; }
+  tr { break-inside: avoid; }
+  th, td { border: 1px solid var(--line); padding: 6px 8px; vertical-align: top; text-align: left; }
+  th { background: var(--soft); font-weight: 600; }
+  td.num { white-space: nowrap; }
+  .yes { color: var(--ok); font-weight: 600; }
+  .no { color: var(--no); font-weight: 600; }
+  .part { color: var(--warn); font-weight: 600; }
+  code { font-family: Consolas, "Courier New", monospace; font-size: 9pt; background: #eef1f6; padding: 1px 4px; border-radius: 3px; }
+  pre { font-family: Consolas, "Courier New", monospace; font-size: 8.8pt; background: #0f1720; color: #e6edf3; padding: 10px 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-all; break-inside: avoid; }
+  .steps { counter-reset: step; }
+  .step { display: grid; grid-template-columns: 34px 1fr; gap: 10px; margin: 8px 0; break-inside: avoid; }
+  .step .n { width: 30px; height: 30px; border-radius: 50%; background: var(--accent); color: #fff; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  .step h3 { margin: 3px 0 2px; }
+  .step .time { color: var(--muted); font-size: 9.5pt; }
+  ul { margin: 4px 0 8px 18px; padding: 0; }
+  li { margin: 2px 0; }
+  .rules li { margin: 5px 0; }
+  .page-break { break-before: page; }
+  .foot { color: var(--muted); font-size: 9pt; margin-top: 24px; border-top: 1px solid var(--line); padding-top: 8px; }
+</style>
+</head>
+<body>
+
+<div class="cover">
+  <h1>WordPress → Static HTML</h1>
+  <div class="sub">User guide: how the converter works, what it can and cannot do, and the rules to follow</div>
+</div>
+
+<div class="box">
+  <strong>In one sentence:</strong> you give the tool a WordPress backup file (<code>.wpress</code>), and it gives you back
+  a ZIP of plain HTML pages that look like the original site and can be uploaded to any web hosting,
+  cPanel included, with no WordPress, PHP or database needed.
+</div>
+
+<h2>1. What you need</h2>
+<table>
+  <tr><th style="width:28%">Item</th><th>Details</th></tr>
+  <tr><td>The backup</td><td>A <code>.wpress</code> file made with the <strong>All-in-One WP Migration</strong> plugin. Other backup types are not supported.</td></tr>
+  <tr><td>Computer</td><td>Windows PC with the tool installed (run <code>setup.ps1</code> once). 16 GB RAM is comfortable. The tool measures the machine when each job starts and uses as much of it as is safe, so a faster PC simply finishes sooner.</td></tr>
+  <tr><td>Free disk space</td><td>About <strong>3 × the backup size</strong> on the drive where jobs are kept (<code>C:\wpsc-jobs</code>). A 3 GB backup needs about 9–10 GB free.</td></tr>
+  <tr><td>Internet</td><td>Not needed for the conversion itself. The tool never contacts your live website.</td></tr>
+</table>
+
+<h2>2. How to start a conversion</h2>
+<h3>Option A: the web screen (easiest)</h3>
+<ul>
+  <li>Run <code>run.ps1</code>. A terminal window opens; keep it open.</li>
+  <li>Open <code>http://127.0.0.1:8000</code> in your browser.</li>
+  <li>Under <strong>File on this computer</strong>, pick your backup. Nothing is uploaded or copied; it is read where it is.</li>
+  <li>Check the options. <strong>One folder per page</strong> and <strong>Link to folders</strong> are on by default (see section 4), and <strong>Concurrent pages</strong> is set to <strong>Auto</strong>. Then click <strong>Start conversion</strong>.</li>
+  <li>The screen shows the current step, the time left for that step and for the whole job, and a live log.</li>
+</ul>
+<h3>Option B: the command line</h3>
+<pre>cd B:\Automation\wordpress-to-html
+.venv\Scripts\python.exe convert.py "C:\bkp\site.wpress" --jobs-dir C:\wpsc-jobs -o C:\wpsc-jobs\exports --screenshots</pre>
+<p>How many pages render at once is measured from your PC; add <code>-c 5</code> to force a number. <code>--screenshots</code> turns on the visual comparison. <code>--flat</code> gives <code>about.html</code>-style pages instead of folders, and <code>--file-links</code> writes links as <code>contact-us/index.html</code> (see below).</p>
+
+<h2>3. The workflow, step by step</h2>
+<p>Every job goes through the same 9 steps. Times are from a real 3.2 GB site with 686 pages.</p>
+
+<div class="steps">
+  <div class="step"><div class="n">1</div><div><h3>Extract the backup</h3>
+    <p>Unpacks the <code>.wpress</code> file: the WordPress files, themes, plugins, images and the database export.</p>
+    <div class="time">About 5 minutes</div></div></div>
+
+  <div class="step"><div class="n">2</div><div><h3>Restore WordPress</h3>
+    <p>Builds a private, temporary copy of the website on your computer: its own small database and web server, invisible to anyone else.
+       All links that point to the live domain are switched to this local copy, so nothing is ever fetched from the real website.
+       The theme and plugins are switched on, and cache or security plugins that would get in the way are paused, in the copy only.</p>
+    <div class="time">About 20 minutes (mostly loading the database)</div></div></div>
+
+  <div class="step"><div class="n">3</div><div><h3>Start WordPress</h3>
+    <p>Starts the local copy and waits for the first page. The very first page view after a restore can take several minutes,
+       because WordPress and Elementor rebuild their caches. The tool waits up to 15 minutes for that.</p>
+    <div class="time">1–5 minutes</div></div></div>
+
+  <div class="step"><div class="n">4</div><div><h3>Find all pages</h3>
+    <p>Asks WordPress for every published page, post, category and custom content type, reads the sitemaps,
+       and later also follows links found inside pages, so pages that nothing else lists are caught too.</p>
+    <div class="time">Under 1 minute</div></div></div>
+
+  <div class="step"><div class="n">5</div><div><h3>Render pages</h3>
+    <p>Opens every page in a real browser (Chrome), lets everything load and animate, scrolls down so lazy images appear,
+       then saves the finished page exactly as a visitor would see it. Analytics and tracking are blocked, so your statistics
+       are not affected. Images, CSS and scripts are read straight from disk for speed.</p>
+    <div class="time">The longest step: about 25 minutes for 686 pages</div></div></div>
+
+  <div class="step"><div class="n">6</div><div><h3>Create the HTML files</h3>
+    <p>Rewrites every saved page for static hosting. Every menu, footer, sidebar and button link is changed to point
+       at the exported page (for example <code>contact-us/</code>; see "Link style" below). A page that cannot be written is
+       recorded as failed; the job continues with the rest.</p>
+    <div class="time">About 7 minutes</div></div></div>
+
+  <div class="step"><div class="n">7</div><div><h3>Collect assets</h3>
+    <p>Gathers every image, stylesheet, script and font the pages use, from the backup's own files.
+       It also includes the "on-demand" scripts (for example a carousel's code) that only load while a page runs.</p>
+    <div class="time">Under 1 minute</div></div></div>
+
+  <div class="step"><div class="n">8</div><div><h3>Check and repair</h3>
+    <p>Tests the finished site. Any file that is missing from the export but exists in the backup is copied in automatically
+       and checked again. It also opens one or two pages of every page design in a browser to look for errors,
+       and compares screenshots of the original and the export.</p>
+    <div class="time">About 10 minutes</div></div></div>
+
+  <div class="step"><div class="n">9</div><div><h3>Package the ZIP</h3>
+    <p>Puts the whole site into one ZIP file and writes a report explaining what was found.</p>
+    <div class="time">About 3 minutes</div></div></div>
+</div>
+
+<div class="box good"><strong>Typical total:</strong> about 1–1½ hours for a 3 GB backup with around 700 pages.
+Smaller sites finish much faster; sites with thousands of pages take longer.</div>
+
+<h2 class="page-break">4. What you get</h2>
+<table>
+  <tr><th style="width:28%">Output</th><th>Where / what</th></tr>
+  <tr><td>The ZIP (to upload)</td><td><code>C:\wpsc-jobs\exports\&lt;site-name&gt;-static.zip</code>. An existing ZIP is never overwritten; a new one gets <code>-2</code>, <code>-3</code> added to its name.</td></tr>
+  <tr><td>The unzipped site</td><td><code>C:\wpsc-jobs\&lt;job-id&gt;\output\</code>. Open <code>index.html</code> to browse it from your computer.</td></tr>
+  <tr><td>The report</td><td><code>C:\wpsc-jobs\&lt;job-id&gt;\report\conversion-report.html</code>. Read the <strong>Quality check</strong> and <strong>Static HTML limitations</strong> sections.</td></tr>
+  <tr><td>Screenshot comparisons</td><td><code>C:\wpsc-jobs\&lt;job-id&gt;\screenshots\</code>: original, export and a "diff" image with the differences in pink.</td></tr>
+</table>
+
+<h3>Page layout</h3>
+<table>
+  <tr><th style="width:28%">Setting</th><th>Result</th></tr>
+  <tr><td><strong>One folder per page</strong> (default)</td><td><code>contact-us/index.html</code>. On a web server the address stays <code>/contact-us/</code>, exactly like WordPress, so Google rankings and old links keep working.</td></tr>
+  <tr><td>One file per page (<code>--flat</code>)</td><td><code>contact-us.html</code>. The web addresses change to <code>/contact-us.html</code>.</td></tr>
+</table>
+<h3>Link style</h3>
+<table>
+  <tr><th style="width:28%">Setting</th><th>Result</th></tr>
+  <tr><td><strong>Link to folders</strong> (default)</td><td>Links are written as <code>contact-us/</code>, the same addresses WordPress used.
+      This is what you want for cPanel or any web server. Opened straight from a disk, such a link shows the folder's file list
+      instead of the page, because there is no server to open <code>index.html</code> for you.</td></tr>
+  <tr><td>Link to files (untick the box, or <code>--file-links</code>)</td><td>Links are written as <code>contact-us/index.html</code>.
+      Works on a web server <em>and</em> when opening the pages from a disk or USB stick. The addresses are longer.</td></tr>
+</table>
+
+<h3>Putting it online (cPanel)</h3>
+<ul>
+  <li>Open cPanel, then <strong>File Manager</strong>, then <code>public_html</code>.</li>
+  <li>Upload the ZIP and click <strong>Extract</strong>, so that <code>index.html</code> ends up directly inside <code>public_html</code>.</li>
+  <li>Open your domain to check. The site also works inside a sub-folder.</li>
+</ul>
+
+<h2>5. What the tool can do</h2>
+<table>
+  <tr><th style="width:50%">Feature</th><th>In the export</th></tr>
+  <tr><td>Page design, fonts, colours, layout, desktop and mobile</td><td class="yes">Exact copy</td></tr>
+  <tr><td>Elementor and other page builders (Gutenberg, Divi, WPBakery…)</td><td class="yes">Exact copy, as rendered by the real site</td></tr>
+  <tr><td>Menus, dropdowns, mobile menu, footer and sidebar links</td><td class="yes">Work; links point directly to the pages</td></tr>
+  <tr><td>Buttons that go to another page</td><td class="yes">Work</td></tr>
+  <tr><td>Buttons that open a popup, scroll, or show/hide something</td><td class="yes">Work (same scripts)</td></tr>
+  <tr><td>Elementor popups (on click, on load, delayed, on exit)</td><td class="yes">Work when the popup is part of the page (Elementor's normal behaviour)</td></tr>
+  <tr><td>Sliders, carousels, tabs, accordions, animations, sticky headers</td><td class="yes">Work</td></tr>
+  <tr><td>Background images, lazy-loaded images, responsive images</td><td class="yes">Included</td></tr>
+  <tr><td>YouTube/Vimeo videos, Google Maps, WhatsApp and chat widgets</td><td class="yes">Work (they load from their own services)</td></tr>
+  <tr><td>Linked PDFs and documents on your site</td><td class="yes">Included</td></tr>
+  <tr><td>SEO: page titles, meta tags, same web addresses (folder layout), sitemap.xml, robots.txt</td><td class="yes">Kept or generated</td></tr>
+  <tr><td>Speed of the finished site</td><td class="yes">Usually faster than WordPress: no PHP or database</td></tr>
+</table>
+
+<h2 class="page-break">6. What the tool cannot do (limitations)</h2>
+<p>A static site has no server program behind it. Anything that must <em>send</em> information to the website, or ask it for
+new information, will <strong>look</strong> right but will not <strong>work</strong>.</p>
+<table>
+  <tr><th style="width:30%">Feature</th><th style="width:22%">In the export</th><th>Why / what to do</th></tr>
+  <tr><td>Contact and quote forms (Elementor Forms, Contact Form 7, WPForms)</td><td class="part">Look right, cannot send</td>
+      <td>Sending needs WordPress. Connect the form to a form service (Formspree, Web3Forms, Getform) or a small PHP mail script. cPanel supports PHP, so a mail script works there.</td></tr>
+  <tr><td>reCAPTCHA</td><td class="part">Shows, cannot verify</td><td>Checking needs a server; handled by the form service or mail script.</td></tr>
+  <tr><td>Site search</td><td class="no">Does not work</td><td>Use a static search tool or Google site search.</td></tr>
+  <tr><td>"Load more", AJAX filters, infinite scroll</td><td class="part">First results only</td><td>Extra results are fetched from WordPress at click time.</td></tr>
+  <tr><td>Popups whose content is fetched when opened</td><td class="part">May be empty</td><td>Rare with Elementor. The report lists pages that use AJAX.</td></tr>
+  <tr><td>Posting comments, user login, member areas</td><td class="no">Do not work</td><td>Need PHP and the database. Existing comments are shown.</td></tr>
+  <tr><td>WooCommerce cart, checkout, payments, stock</td><td class="no">Do not work</td><td>Product pages can be shown as a catalogue only.</td></tr>
+  <tr><td>Anything that changes on its own (live prices, scheduled posts, counters)</td><td class="part">Frozen</td><td>The export is a snapshot of the day it was made. Re-convert to update.</td></tr>
+  <tr><td>Pages behind a login, drafts, private pages</td><td class="no">Not exported</td><td>Only published, public pages are converted.</td></tr>
+  <tr><td>Pages nothing links to and WordPress does not list</td><td class="part">May be missed</td><td>Very rare. Up to 5,000 pages per job by default.</td></tr>
+  <tr><td>Fonts and scripts from other websites (e.g. Google Fonts)</td><td class="part">Still load online</td><td>Kept pointing at their original service by default.</td></tr>
+  <tr><td>Images missing from the backup itself</td><td class="no">Stay missing</td><td>They are broken on the live site too. The report lists them; fix them in WordPress.</td></tr>
+</table>
+<div class="box warn"><strong>Every report lists these for your specific site</strong> under "Static HTML limitations", for example
+"Elementor Forms on 1 page". Read it before publishing so you know which forms or features need attention.</div>
+
+<h2>7. Understanding the Quality check</h2>
+<table>
+  <tr><th style="width:26%">Result</th><th>Meaning</th></tr>
+  <tr><td><strong>Repaired automatically</strong></td><td>Files that were missing from the export but found in the backup, and copied in. Nothing for you to do.</td></tr>
+  <tr><td><strong>Problems</strong></td><td>Something the conversion got wrong. The job is shown as <em>"Completed with N problem(s)"</em>. The ZIP is still made; check the listed pages before publishing.</td></tr>
+  <tr><td><strong>Source issues</strong></td><td>Things that are broken on the original website too: links to pages that do not exist, images missing from the backup. Fix them in WordPress, then re-convert.</td></tr>
+  <tr><td><strong>Visual similarity</strong></td><td>How closely the export's screenshots match the original, compared per page design. Around 90% or more is normal. Carousels stopping on a different slide lower the score without being a real problem; look at the pink "diff" image to judge.</td></tr>
+</table>
+
+<h2 class="page-break">8. Rules to follow</h2>
+<ol class="rules">
+  <li><strong>Use only <code>.wpress</code> backups</strong> made with All-in-One WP Migration.</li>
+  <li><strong>Keep 3 × the backup size free</strong> on the jobs drive before starting.</li>
+  <li><strong>Let the tool decide how hard to work.</strong> "Auto" measures cores and memory when each job starts.
+      Set a number by hand only if you want to keep the PC free for other work.</li>
+  <li><strong>One conversion at a time</strong> on a normal PC. Each job runs its own database, web server and browser;
+      a machine with 8 or more cores and 32 GB of memory may run two.</li>
+  <li><strong>If a job stops or fails, resume it; do not start again.</strong> Resume re-uses everything already done:
+      the restored site, the database and every page already rendered. In the web screen click <strong>Resume</strong>; on the command line use <code>--resume &lt;job-id&gt;</code>.</li>
+  <li><strong>Never resume the same job from the web screen and the command line at the same time.</strong></li>
+  <li><strong>Do not delete a job folder</strong> (<code>C:\wpsc-jobs\&lt;job-id&gt;</code>) until you are happy with the result. It is what makes resume possible.</li>
+  <li><strong>The tool never deletes your data by itself.</strong> Your backup file is only read. A previous output is renamed to <code>output-previous-…</code>, and an existing ZIP is never overwritten.</li>
+  <li><strong>Keep the terminal window open</strong> while a job runs. Closing it stops the job (it can be resumed).
+      Clicking inside the window is safe.</li>
+  <li><strong>Read the report before publishing</strong>, especially "Quality check" and "Static HTML limitations".</li>
+  <li><strong>Fix content problems in WordPress, not in the export.</strong> Then make a new backup and convert again,
+      so the next export is correct too.</li>
+  <li><strong>The export is a snapshot.</strong> After changing the WordPress site, make a new backup and re-convert.</li>
+  <li><strong>Keep the web screen private.</strong> It only runs on your own computer (<code>127.0.0.1</code>); do not expose it to the network.</li>
+</ol>
+
+<h2>9. Quick troubleshooting</h2>
+<table>
+  <tr><th style="width:36%">What you see</th><th>What to do</th></tr>
+  <tr><td>Job failed while starting WordPress or rendering</td><td>Resume it. Nothing already done is repeated.</td></tr>
+  <tr><td>"Not enough free space"</td><td>Free up space on the jobs drive (3 × the backup size), then start or resume.</td></tr>
+  <tr><td>Job list in the web screen looks empty</td><td>Press Ctrl+F5 to reload the page.</td></tr>
+  <tr><td>"Completed with problems"</td><td>Open the report, then the Quality check section. The ZIP is usable; review the listed pages.</td></tr>
+  <tr><td>A form does not send on the live static site</td><td>Expected. Connect it to a form service or a PHP mail script (section 6).</td></tr>
+  <tr><td>Clicking a link opens a folder list instead of a page</td><td>You are opening the site from a disk, where folder links cannot work. On a web server it is correct. To browse locally, untick <strong>Link to folders</strong> and convert again.</td></tr>
+  <tr><td>Background images missing on the local preview</td><td>Normal when the live site is offline; the final export includes them. Check <code>output\index.html</code>.</td></tr>
+</table>
+
+<div class="foot">WordPress → Static HTML converter · User guide · September 2026</div>
+
+</body>
+</html>
