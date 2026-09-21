@@ -378,6 +378,10 @@ button:focus-visible, a:focus-visible, input:focus-visible, .backup-item:focus-v
   box-shadow: 0 0 0 3px var(--accent-soft); }
 .small-print { font-size: .76rem; margin: 8px 0 0; }
 
+/* The submit button used to sit under a note that supplied this gap. */
+#start-btn { margin-top: 20px; }
+.form-error + #start-btn { margin-top: 12px; }
+
 /* ---------- timing ---------- */
 .timing {
   display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
