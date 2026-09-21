@@ -116,7 +116,15 @@ def main() -> int:
 
     db = report["mysql"]
     line(db["found"], "MySQL / MariaDB",
-         f"{db['flavour']} {db['version']} ({db['source']})" if db["found"] else "")
+         f"{db['flavour']} {db['version']} ({db['source']})" if db["server_found"] else "")
+    if db["server_found"]:
+        # A distribution keeps these in /usr/bin while the server is in
+        # /usr/sbin. Without mariadb-install-db no job can start its database,
+        # and without the client the import falls back to the slow Python path.
+        line(bool(db["install_db_binary"]), "  mariadb-install-db",
+             db["install_db_binary"] or "required to create a job's database")
+        line(bool(db["client_binary"]) or None, "  database client",
+             db["client_binary"] or "absent: imports will use the slower Python path")
 
     browser = report["playwright"]
     line(browser["chromium_ready"], "Chromium",
@@ -129,8 +137,11 @@ def main() -> int:
     probe = settings.jobs_dir if settings.jobs_dir.exists() else Path.cwd()
     usage = shutil.disk_usage(probe)
     enough = usage.free > 5 * 1024**3
+    # The drive on Windows; the job directory itself on Linux, where the anchor
+    # is always "/" and would say nothing about which volume /srv is on.
+    where = probe.anchor if sys.platform == "win32" else probe
     line(enough or None, "Free disk space",
-         f"{human_bytes(usage.free)} on {probe.anchor or probe}"
+         f"{human_bytes(usage.free)} on {where}"
          + ("" if enough else "  (a conversion needs ~3x the .wpress size)"))
 
     # -- what to do ---------------------------------------------------------
@@ -142,19 +153,26 @@ def main() -> int:
         if section.get("instructions")
     ]
 
+    windows = sys.platform == "win32"
     if ready:
         print(f"  {paint('Ready to convert.', GREEN)}")
-        print(f"  {paint('Start with:  .\\run.ps1', DIM)}")
+        print(f"  {paint('Start with:  .\\run.ps1' if windows else 'Start with:  .venv/bin/python app.py', DIM)}")
     else:
         print(f"  {paint('Not ready.', RED)} Fix the following:")
         for instruction in problems:
             print()
             for text in str(instruction).splitlines():
                 print(f"    {text}")
-        if report.get("auto_provision", True):
+        # Only true on Windows: provision_php refuses on every other platform,
+        # so offering it to a Linux operator sends them looking for a script
+        # that cannot help them.
+        if windows:
             print()
             print("  PHP and MariaDB can also be fetched automatically: run .\\setup.ps1,")
             print("  or simply start a conversion and the tool will download them.")
+        else:
+            print()
+            print("  On Ubuntu/Debian, ./setup.sh installs all of the above.")
 
     print()
     return 0 if ready else 1

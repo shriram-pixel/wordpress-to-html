@@ -1,9 +1,12 @@
 # wp-static-converter dependencies
 #
-# Floor-pinned rather than exact-pinned: the tool targets Python 3.11 through
+# Floor-pinned rather than exact-pinned: the tool targets Python 3.12 through
 # 3.14, and exact pins would force source builds on the newer interpreters
 # where the older wheels do not exist. Run scripts/freeze.ps1 to produce an
 # exact lock file for a reproducible deployment.
+#
+# 3.12 is a hard floor, not a preference: shutil.rmtree(onexc=) arrived in
+# 3.12 and enum.StrEnum in 3.11. Ubuntu 22.04 (Python 3.10) cannot run this.
 
 # ---- Web framework / job API -------------------------------------------------
 fastapi>=0.115

@@ -248,13 +248,32 @@ def probe_mysql(server_binary: Path, source: str = "unknown") -> MysqlRuntime | 
         version = match.group(1) if match else "unknown"
         flavour = "mariadb" if "mariadb" in text.lower() else "mysql"
 
+        # A portable Windows build keeps the server and its helpers in one
+        # directory. A Linux distribution does not: the server is
+        # /usr/sbin/mariadbd while mariadb-install-db, mariadb and
+        # mariadb-admin are in /usr/bin. Looking only beside the server finds
+        # none of them, and the caller then falls back to MySQL's
+        # --initialize-insecure, which MariaDB has never implemented.
         bindir = server_binary.parent
+        searched: list[Path] = []
+        for directory in (bindir, bindir.parent / "bin", Path("/usr/bin"),
+                          Path("/usr/local/bin")):
+            if directory not in searched and directory.is_dir():
+                searched.append(directory)
 
         def first(*names: str) -> Path | None:
+            # Beside the server first: with several MariaDB installations on
+            # one machine, the helpers shipped with this server are the ones
+            # that match its data directory format.
+            for directory in searched:
+                for name in names:
+                    candidate = directory / f"{name}{_EXE}"
+                    if candidate.is_file():
+                        return candidate
             for name in names:
-                candidate = bindir / f"{name}{_EXE}"
-                if candidate.is_file():
-                    return candidate
+                found = shutil.which(name)
+                if found:
+                    return Path(found)
             return None
 
         return MysqlRuntime(
@@ -746,6 +765,25 @@ def find_chromium() -> tuple[bool, str | None, bool]:
     return True, None, False
 
 
+def _mysql_usable(mysql: MysqlRuntime) -> bool:
+    """Whether this server can actually make a data directory for a job."""
+    return mysql.flavour != "mariadb" or mysql.install_db_binary is not None
+
+
+def _mysql_instructions(mysql: MysqlRuntime | None) -> str | None:
+    if mysql is None:
+        return _mysql_manual_instructions()
+    if _mysql_usable(mysql):
+        return None
+    return (
+        f"MariaDB {mysql.version} was found at {mysql.server_binary}, but "
+        "mariadb-install-db was not found beside it or on PATH. MariaDB cannot "
+        "create a data directory without it, so every conversion would fail at "
+        "the restore step.\n"
+        "On Debian/Ubuntu:  sudo apt install mariadb-client mariadb-server"
+    )
+
+
 def diagnose(cache_dir: Path, php_override: str | None = None,
              mysqld_override: str | None = None) -> dict[str, object]:
     """Report on every dependency, for ``scripts/doctor.py`` and ``/api/health``."""
@@ -766,12 +804,21 @@ def diagnose(cache_dir: Path, php_override: str | None = None,
             "instructions": None if php else _php_manual_instructions(),
         },
         "mysql": {
-            "found": mysql is not None,
+            # MariaDB cannot create a data directory without
+            # mariadb-install-db, so a server found without its helper is not
+            # usable -- and saying "OK" here is worse than saying nothing: it
+            # sends someone into a batch that fails on its first job.
+            "found": mysql is not None and _mysql_usable(mysql),
+            "server_found": mysql is not None,
             "flavour": mysql.flavour if mysql else None,
             "version": mysql.version if mysql else None,
             "binary": str(mysql.server_binary) if mysql else None,
             "source": mysql.source if mysql else None,
-            "instructions": None if mysql else _mysql_manual_instructions(),
+            "install_db_binary": str(mysql.install_db_binary)
+                                 if mysql and mysql.install_db_binary else None,
+            "client_binary": str(mysql.client_binary)
+                             if mysql and mysql.client_binary else None,
+            "instructions": _mysql_instructions(mysql),
         },
         "playwright": {
             "installed": playwright_installed,

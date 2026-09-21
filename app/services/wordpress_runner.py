@@ -45,6 +45,15 @@ logger = logging.getLogger(__name__)
 _IS_WINDOWS = platform.system() == "Windows"
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0
 
+#: A job's database is configured entirely on its command line. Without this,
+#: a distribution-packaged server also reads /etc/mysql/my.cnf, which on Debian
+#: and Ubuntu sets pid-file, user and socket for the *system* instance: the
+#: pid-file lands in /run/mysqld, which the run user cannot write and which no
+#: longer exists once setup.sh disables the service. The server then exits
+#: before its port opens, and the job reports only that the database did not
+#: start. Must be the first argument.
+_NO_SYSTEM_DEFAULTS = ("--no-defaults",)
+
 
 class ServerStartupError(RuntimeError):
     """A managed server did not come up in time."""
@@ -129,15 +138,24 @@ class MysqlServer:
         if self.runtime.flavour == "mariadb" and self.runtime.install_db_binary:
             command = [
                 str(self.runtime.install_db_binary),
+                *_NO_SYSTEM_DEFAULTS,
                 f"--datadir={self.data_dir}",
                 "--default-user",
             ]
             if not _IS_WINDOWS:
                 command.append(f"--basedir={self.runtime.base_dir}")
+        elif self.runtime.flavour == "mariadb":
+            raise ServerStartupError(
+                "MariaDB is installed but mariadb-install-db was not found next to "
+                f"{self.runtime.server_binary} or on PATH, and MariaDB cannot create a "
+                "data directory without it (--initialize-insecure is MySQL-only).\n"
+                "On Debian/Ubuntu: sudo apt install mariadb-client mariadb-server"
+            )
         else:
-            # MySQL, and MariaDB builds without the helper, use --initialize.
+            # MySQL alone uses --initialize; MariaDB has never implemented it.
             command = [
                 str(self.runtime.server_binary),
+                *_NO_SYSTEM_DEFAULTS,
                 "--initialize-insecure",
                 f"--datadir={self.data_dir}",
                 f"--basedir={self.runtime.base_dir}",
@@ -166,8 +184,14 @@ class MysqlServer:
 
         command = [
             str(self.runtime.server_binary),
+            *_NO_SYSTEM_DEFAULTS,
             f"--datadir={self.data_dir}",
             f"--port={self.port}",
+            # Debian's my.cnf would otherwise put this in /run/mysqld, which a
+            # non-root user cannot write and which the disabled service no
+            # longer creates. --no-defaults covers it; this is belt and braces,
+            # and keeps the file with the job it belongs to.
+            f"--pid-file={Path(self.data_dir).parent / 'mysql.pid'}",
             f"--bind-address={self.host}",
             # Loopback only, and no chance of clashing with a system instance.
             "--skip-name-resolve",

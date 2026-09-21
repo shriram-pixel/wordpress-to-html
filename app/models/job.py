@@ -323,6 +323,12 @@ class JobStore:
         with self._lock:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA synchronous=NORMAL")
+            # Several conversions share this file, each writing progress every
+            # second or so. WAL allows one writer at a time; without a timeout
+            # the loser of a collision fails immediately with "database is
+            # locked" rather than waiting the moment it takes, which on a
+            # batch of ten sites means jobs dying at random.
+            self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(_SCHEMA)
             self._conn.commit()
 
