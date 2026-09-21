@@ -239,3 +239,52 @@ def pick_representative(pages: dict[str, str], limit: int, per_template: int = 2
             if len(chosen) >= limit:
                 return chosen[:limit]
     return chosen[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Structural comparison
+# ---------------------------------------------------------------------------
+#: Elements worth counting: content a reader would miss. Scripts, styles and
+#: meta links are left out because the export deliberately changes them.
+_COUNTED_TAGS = ("img", "a", "h1", "h2", "h3", "li", "table", "form", "iframe", "video")
+
+
+def structural_signature(html: str) -> dict:
+    """Count the content elements of a page, plus the length of its text.
+
+    A screenshot diff can miss a section that moved below the fold, and a link
+    check only proves that files exist. Counting what a reader would actually
+    see catches a whole block that failed to survive the rewrite.
+    """
+    from bs4 import BeautifulSoup
+
+    from app.services.html_processor import HTML_PARSER
+
+    soup = BeautifulSoup(html or "", HTML_PARSER)
+    for tag in soup.find_all(["script", "style", "noscript"]):
+        tag.decompose()
+
+    signature = {name: len(soup.find_all(name)) for name in _COUNTED_TAGS}
+    signature["text"] = len(" ".join((soup.get_text(" ") or "").split()))
+    return signature
+
+
+def compare_structure(captured: dict, exported: dict, *, tolerance: float = 0.05) -> list[str]:
+    """Differences that mean the export lost content. Returns readable lines.
+
+    Only losses are reported: an export with *more* of something is usually
+    the page's own scripts having added markup during the capture.
+    """
+    problems: list[str] = []
+    for name, before in captured.items():
+        after = exported.get(name, 0)
+        if after >= before:
+            continue
+        missing = before - after
+        # A page with two images that ships one has lost half its content; a
+        # page with fifty that ships forty-nine has lost a lazy-loaded one.
+        allowed = int(before * (0.02 if name == "text" else tolerance))
+        if missing > allowed:
+            label = "characters of text" if name == "text" else f"<{name}> element(s)"
+            problems.append(f"{missing:,} fewer {label} ({before:,} captured, {after:,} exported)")
+    return problems

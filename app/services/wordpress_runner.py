@@ -489,58 +489,79 @@ class PhpServer:
 def _wait_for_wordpress(
     base_url, problem, tail_log, timeout, expected_status, should_stop=None
 ) -> tuple[bool, str]:
-    """Poll the home page until WordPress renders something real.
+    """Wait until WordPress renders a real page.
 
-    An open port is not enough: WordPress may still be erroring on a database
-    connection, so the body is inspected too. *problem* returns a reason string
-    when the server has died, so a crash fails fast instead of waiting out the
-    whole timeout.
+    The first view after a restore is genuinely slow: WordPress, the theme and
+    a page builder rebuild caches and per-page CSS, which on a large site
+    takes minutes. That request is therefore made **once**, in a background
+    thread, and given the whole budget.
+
+    Asking again while it works is worse than waiting. PHP does not stop when
+    a client gives up, so every retry starts another full render on another
+    worker -- on one real job, twelve of them at once, each competing for the
+    same four cores.
     """
+    import concurrent.futures
     import httpx
 
     deadline = time.monotonic() + timeout
     last_detail = "no response"
 
-    while time.monotonic() < deadline:
-        reason = problem()
-        if reason:
-            return False, f"{reason}\n{tail_log()}"
-        if should_stop is not None and should_stop():
-            return False, "cancelled while waiting for WordPress"
-        remaining = max(5.0, deadline - time.monotonic())
-        # A single request cannot be interrupted, so when a cancel is possible
-        # it is capped: the wait as a whole still runs to the deadline, but a
-        # cancel is noticed in between rather than up to 15 minutes later.
-        if should_stop is not None:
-            remaining = min(remaining, 20.0)
-        try:
-            # The first request after a restore is genuinely slow -- WordPress
-            # and page builders rebuild caches, per-page CSS and search indexes
-            # on first view, which on a large site takes minutes. Give that one
-            # request all the remaining time: abandoning it does not stop PHP,
-            # it only means asking again and waiting for the same work.
-            logger.info(
-                "waiting for WordPress's first page (up to %.0f more seconds; the first "
-                "view after a restore can take several minutes)", remaining,
-            )
-            with httpx.Client(timeout=httpx.Timeout(remaining, connect=15.0),
-                              follow_redirects=False) as client:
-                response = client.get(base_url + "/")
-            body = response.text[:4000]
+    def fetch() -> tuple[int, str]:
+        with httpx.Client(timeout=httpx.Timeout(timeout, connect=15.0),
+                          follow_redirects=False) as client:
+            response = client.get(base_url + "/")
+        return response.status_code, response.text[:4000]
 
-            if "Error establishing a database connection" in body:
-                last_detail = "WordPress cannot reach its database"
-            elif "There has been a critical error" in body:
-                last_detail = "WordPress reported a critical error on the home page"
-            elif response.status_code in expected_status:
-                return True, f"HTTP {response.status_code}"
+    logger.info(
+        "waiting for WordPress's first page (up to %.0f seconds; the first view after "
+        "a restore rebuilds caches and can take minutes)", timeout,
+    )
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="wp-warmup")
+    future = pool.submit(fetch)
+    try:
+        announced = time.monotonic()
+        while True:
+            if should_stop is not None and should_stop():
+                return False, "cancelled while waiting for WordPress"
+            reason = problem()
+            if reason:
+                return False, f"{reason}\n{tail_log()}"
+
+            try:
+                status, body = future.result(timeout=1.0)
+            except concurrent.futures.TimeoutError:
+                if time.monotonic() > deadline:
+                    return False, f"{last_detail} (gave up after {timeout:.0f}s)\n{tail_log()}"
+                if time.monotonic() - announced >= 30:
+                    announced = time.monotonic()
+                    logger.info(
+                        "still waiting for WordPress's first page (%.0fs so far)",
+                        timeout - (deadline - time.monotonic()),
+                    )
+                continue
+            except Exception as exc:
+                last_detail = f"{type(exc).__name__}: {exc}"
             else:
-                last_detail = f"HTTP {response.status_code}"
-        except Exception as exc:
-            last_detail = f"{type(exc).__name__}: {exc}"
-        time.sleep(1.0)
+                if "Error establishing a database connection" in body:
+                    last_detail = "WordPress cannot reach its database"
+                elif "There has been a critical error" in body:
+                    last_detail = "WordPress reported a critical error on the home page"
+                elif status in expected_status:
+                    return True, f"HTTP {status}"
+                else:
+                    last_detail = f"HTTP {status}"
 
-    return False, f"{last_detail}\n{tail_log()}"
+            # The request finished but the answer was not usable: WordPress may
+            # still be starting, so try again with what is left of the budget.
+            if time.monotonic() > deadline:
+                return False, f"{last_detail}\n{tail_log()}"
+            time.sleep(2.0)
+            future = pool.submit(fetch)
+    finally:
+        # Never wait for a request still in flight: the caller is either going
+        # on to render pages or shutting the server down.
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 class _TcpBalancer:

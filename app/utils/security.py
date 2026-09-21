@@ -132,16 +132,31 @@ def sanitise_archive_path(prefix: str, name: str) -> PurePosixPath:
 
 
 def is_within(root: Path, candidate: Path) -> bool:
-    """True when *candidate* resolves to a location inside *root*."""
+    """True when *candidate* resolves to a location inside *root*.
+
+    Only the part of the path that already exists is resolved, and the rest is
+    appended unresolved. That keeps the symlink protection -- a symlinked
+    parent still resolves to wherever it really points -- while giving a
+    stable answer for a path whose folders are being created at that moment by
+    another thread, which Windows can otherwise report under a different name.
+    """
     try:
         root_r = root.resolve(strict=False)
-        cand_r = candidate.resolve(strict=False)
+        node, missing = candidate, []
+        while not node.exists() and node.parent != node:
+            missing.append(node.name)
+            node = node.parent
+        cand_r = node.resolve(strict=False).joinpath(*reversed(missing))
     except (OSError, RuntimeError):
         return False
     try:
         cand_r.relative_to(root_r)
     except ValueError:
-        return False
+        # Windows compares paths case-insensitively, and a drive can report a
+        # different case for the same folder.
+        return os.path.normcase(str(cand_r)).startswith(
+            os.path.normcase(str(root_r)) + os.sep
+        )
     return True
 
 

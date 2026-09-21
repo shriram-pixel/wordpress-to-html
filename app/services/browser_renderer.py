@@ -40,9 +40,15 @@ from typing import Any
 from app.config import ConversionOptions
 from urllib.parse import urlsplit
 
+from app.services.request_policy import RequestAction, classify_request
 from app.utils.urls import is_local_origin
 
 logger = logging.getLogger(__name__)
+
+#: How long a page may take to go quiet before it is captured anyway. Fonts,
+#: images and the DOM settle within a couple of seconds on a normal page; what
+#: runs past this is a widget holding a connection open.
+_SETTLE_BUDGET_SECONDS = 12.0
 
 #: Injected before any page script runs. Neutralises the handful of things that
 #: make a capture non-deterministic or that would record a visitor's state.
@@ -151,66 +157,15 @@ _READINESS_SCRIPT = r"""
 """
 
 
-#: Hosts that exist only to observe visitors. Blocking them during capture is
-#: the single largest speed win available on a real site.
-#:
-#: They are never part of the export -- external resources keep their original
-#: URLs and are not downloaded -- so fetching them while rendering buys nothing.
-#: Worse, tag managers and analytics keep firing beacons indefinitely, so the
-#: page never goes network-quiet and every capture burns its full settle budget.
-#: On a 600-page Elementor site that was the difference between ~30s and ~7s per
-#: page.
-#:
-#: Fonts, stylesheets and images are deliberately *not* here: they affect layout
-#: and therefore the screenshot.
-_TRACKING_HOSTS = frozenset({
-    "google-analytics.com", "www.google-analytics.com", "ssl.google-analytics.com",
-    "googletagmanager.com", "www.googletagmanager.com",
-    "googletagservices.com", "googlesyndication.com", "pagead2.googlesyndication.com",
-    "doubleclick.net", "stats.g.doubleclick.net", "analytics.google.com",
-    "connect.facebook.net", "facebook.com", "www.facebook.com", "facebook.net",
-    "hotjar.com", "static.hotjar.com", "script.hotjar.com", "in.hotjar.com",
-    "clarity.ms", "www.clarity.ms",
-    "segment.com", "cdn.segment.com", "api.segment.io",
-    "mixpanel.com", "cdn.mxpnl.com", "api.mixpanel.com",
-    "matomo.cloud", "cdn.matomo.cloud",
-    "newrelic.com", "js-agent.newrelic.com", "bam.nr-data.net",
-    "sentry.io", "browser.sentry-cdn.com",
-    "intercom.io", "widget.intercom.io", "js.intercomcdn.com",
-    "crisp.chat", "client.crisp.chat",
-    "tawk.to", "embed.tawk.to",
-    "drift.com", "js.driftt.com",
-    "hubspot.com", "js.hs-scripts.com", "js.hsadspixel.net", "track.hubspot.com",
-    "zdassets.com", "static.zdassets.com",
-    "cloudflareinsights.com", "static.cloudflareinsights.com",
-    "tiktok.com", "analytics.tiktok.com",
-    "linkedin.com", "snap.licdn.com", "px.ads.linkedin.com",
-    "bing.com", "bat.bing.com",
-    "criteo.com", "criteo.net", "taboola.com", "outbrain.com",
-    "addthis.com", "sharethis.com", "addtoany.com",
-    "quantserve.com", "scorecardresearch.com",
-    "adservice.google.com", "adservice.google.co.in",
-})
-
-#: Chromium request types that never affect what a page looks like.
-_TRACKING_RESOURCE_TYPES = frozenset({"ping", "beacon", "csp_report"})
-
-
-def _is_tracking_request(url: str, resource_type: str) -> bool:
-    """Whether a request is pure telemetry and safe to block during capture."""
-    if resource_type in _TRACKING_RESOURCE_TYPES:
-        return True
-    try:
-        host = (urlsplit(url).hostname or "").lower().rstrip(".")
-    except ValueError:
-        return False
-    if not host:
-        return False
-    if host in _TRACKING_HOSTS:
-        return True
-    # Match subdomains without matching an unrelated host that merely ends in
-    # the same letters.
-    return any(host.endswith("." + blocked) for blocked in _TRACKING_HOSTS)
+#: One place decides what happens to a request: see request_policy. The
+#: renderer acts on BLOCK; the asset collector acts on SAVE.
+def _is_tracking_request(url: str, resource_type: str, *, method: str = "GET",
+                         post_data: str | None = None, download_media: bool = True) -> bool:
+    """Whether this request must not be made at all while capturing."""
+    return classify_request(
+        url, resource_type, method=method, post_data=post_data,
+        download_media=download_media,
+    ) is RequestAction.BLOCK
 
 
 #: Fixed, because Python's guess comes from the Windows registry there, where
@@ -233,6 +188,14 @@ _CONTENT_TYPES = {
     ".pdf": "application/pdf", ".xml": "application/xml; charset=utf-8",
     ".txt": "text/plain; charset=utf-8", ".html": "text/html; charset=utf-8",
 }
+
+
+def _safe_post_data(request) -> str | None:
+    """A request's body, or None when Playwright cannot provide it."""
+    try:
+        return request.post_data
+    except Exception:
+        return None
 
 
 class _DiskFiles:
@@ -325,6 +288,11 @@ class RenderedPage:
     desktop_screenshot: Path | None = None
     mobile_screenshot: Path | None = None
     duration_seconds: float = 0.0
+    timings: dict[str, float] = field(default_factory=dict)
+    """Seconds spent in each phase of the render: navigate, load, scroll,
+    settle, capture, screenshot. Rendering is most of a conversion, so
+    knowing which phase costs the time is the difference between tuning and
+    guessing."""
     attempts: int = 1
     warnings: list[str] = field(default_factory=list)
 
@@ -430,7 +398,12 @@ class BrowserRenderer:
         if self.block_tracking or self._disk is not None:
             async def _route(route, request):
                 try:
-                    if self.block_tracking and _is_tracking_request(request.url, request.resource_type):
+                    if self.block_tracking and _is_tracking_request(
+                        request.url, request.resource_type,
+                        method=request.method,
+                        post_data=_safe_post_data(request),
+                        download_media=self.options.download_media,
+                    ):
                         self._blocked += 1
                         await route.abort()
                         return
@@ -506,7 +479,15 @@ class BrowserRenderer:
             last_error: Exception | None = None
             for attempt in range(1, self.retries + 2):
                 try:
-                    page = await self._render_once(url, capture_screenshots, attempt)
+                    # Each attempt gets more time than the last. A page that
+                    # timed out is usually a slow one, not a broken one: a
+                    # WordPress site restored with all its plugins can take
+                    # half a minute to build a page the first time, and
+                    # retrying with the same budget just fails again.
+                    page = await self._render_once(
+                        url, capture_screenshots, attempt,
+                        timeout_ms=self.timeout_ms * attempt,
+                    )
                     page.attempts = attempt
                     return page
                 except Exception as exc:
@@ -524,7 +505,8 @@ class BrowserRenderer:
                 page_errors=[f"{type(last_error).__name__}: {last_error}"],
             )
 
-    async def _render_once(self, url: str, capture_screenshots, attempt: int) -> RenderedPage:
+    async def _render_once(self, url: str, capture_screenshots, attempt: int,
+                           timeout_ms: int | None = None) -> RenderedPage:
         started = time.monotonic()
         page = await self._context.new_page()
 
@@ -593,16 +575,30 @@ class BrowserRenderer:
 
         warnings: list[str] = []
 
+        timings: dict[str, float] = {}
+        mark = time.monotonic()
+
+        def phase(name: str) -> None:
+            nonlocal mark
+            now = time.monotonic()
+            timings[name] = round(now - mark, 3)
+            mark = now
+
         try:
-            response = await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+            budget = timeout_ms or self.timeout_ms
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=budget)
             status = response.status if response else None
+            phase("navigate")
 
             await self._wait_for_load(page, warnings)
+            phase("load")
 
             if self.options.capture_lazy_assets:
                 await self._scroll_through(page)
+            phase("scroll")
 
             await self._wait_until_settled(page, inflight, last_activity, warnings)
+            phase("settle")
 
             # One last nudge for lazy loaders that only react to a scroll event.
             try:
@@ -614,6 +610,7 @@ class BrowserRenderer:
             html = await page.content()
             title = await page.title()
             links = await self._collect_links(page)
+            phase("capture")
 
             desktop_shot = mobile_shot = None
             # Either a flag, or a callback that decides from the rendered HTML
@@ -623,6 +620,7 @@ class BrowserRenderer:
             )
             if take_shot and self.screenshot_dir:
                 desktop_shot, mobile_shot = await self._capture_screenshots(page, url)
+            phase("screenshot")
 
             return RenderedPage(
                 url=url,
@@ -637,6 +635,7 @@ class BrowserRenderer:
                 desktop_screenshot=desktop_shot,
                 mobile_screenshot=mobile_shot,
                 duration_seconds=time.monotonic() - started,
+                timings=timings,
                 warnings=warnings,
             )
         finally:
@@ -662,7 +661,13 @@ class BrowserRenderer:
         holding a long-lived connection -- this tracks in-flight requests
         directly and accepts a small number of stragglers.
         """
-        deadline = time.monotonic() + (self.timeout_ms / 1000.0)
+        # Bounded separately from the page timeout. A page that keeps a
+        # connection open -- a chat widget, a poller, a video embed -- never
+        # goes quiet, and waiting the full page budget for each one turns a
+        # 10-second page into a 45-second one. Everything that matters for the
+        # capture (fonts, images, the DOM settling) is done long before this.
+        budget = min(self.timeout_ms / 1000.0, _SETTLE_BUDGET_SECONDS)
+        deadline = time.monotonic() + budget
         quiet_required = max(0.35, self.options.extra_settle_ms / 1000.0)
         previous_signature: tuple | None = None
         stable_since: float | None = None

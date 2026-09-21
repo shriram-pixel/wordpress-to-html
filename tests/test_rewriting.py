@@ -616,3 +616,42 @@ def test_links_to_folders_with_spaces_are_encoded():
     named = AssetMap(site_hosts=HOSTS, folder_links=False)
     named.add_page(BASE + "/sheets-and%20plates/")
     assert named.href_for(BASE + "/sheets-and%20plates/", "index.html") ==         "sheets-and%20plates/index.html"
+
+
+# ---------------------------------------------------------------------------
+# Structural comparison (does the export still contain the page's content?)
+# ---------------------------------------------------------------------------
+def test_structure_comparison_spots_lost_content():
+    from app.services.quality import compare_structure, structural_signature
+
+    captured = structural_signature(
+        "<html><body><h1>Products</h1>"
+        + "<img src='a.jpg'>" * 12
+        + "<ul>" + "<li>item</li>" * 8 + "</ul>"
+        + "<p>" + "word " * 400 + "</p></body></html>"
+    )
+    # An export that lost the gallery and half the text.
+    damaged = structural_signature(
+        "<html><body><h1>Products</h1>"
+        + "<img src='a.jpg'>" * 2
+        + "<ul>" + "<li>item</li>" * 8 + "</ul>"
+        + "<p>" + "word " * 180 + "</p></body></html>"
+    )
+
+    problems = compare_structure(captured, damaged)
+    assert any("<img>" in p for p in problems)
+    assert any("text" in p for p in problems)
+
+
+def test_structure_comparison_ignores_scripts_and_small_differences():
+    from app.services.quality import compare_structure, structural_signature
+
+    captured = structural_signature(
+        "<html><body><script>var a = 1;</script>"
+        + "<img src='a.jpg'>" * 40 + "<p>hello there</p></body></html>"
+    )
+    # The export drops the injected script and one lazy image: not a fault.
+    exported = structural_signature(
+        "<html><body>" + "<img src='a.jpg'>" * 39 + "<p>hello there</p></body></html>"
+    )
+    assert compare_structure(captured, exported) == []

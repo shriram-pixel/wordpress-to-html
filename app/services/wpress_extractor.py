@@ -367,9 +367,26 @@ class PurePythonWpressExtractor(WpressExtractor):
 
     name = "pure-python"
 
-    def __init__(self, *, chunk_size: int = _COPY_CHUNK, preserve_mtime: bool = True) -> None:
+    #: Files up to this size are written by the worker pool; anything larger
+    #: is streamed straight to disk so a huge video never sits in memory.
+    _POOLED_MAX = 8 * 1024 * 1024
+
+    #: Ceiling on payloads queued for writing, so reading cannot run away from
+    #: writing and fill memory with a gigabyte of pending files.
+    _QUEUED_BYTES = 128 * 1024 * 1024
+
+    def __init__(self, *, chunk_size: int = _COPY_CHUNK, preserve_mtime: bool = True,
+                 workers: int = 0) -> None:
         self.chunk_size = chunk_size
         self.preserve_mtime = preserve_mtime
+        # A backup is tens of thousands of small files, and each one costs a
+        # create, a write and -- on Windows -- an antivirus scan. Reading stays
+        # sequential (one pass over the archive); only the writing spreads out.
+        if workers <= 0:
+            from app.utils.capacity import cpu_count
+
+            workers = max(2, min(8, cpu_count()))
+        self.workers = workers
 
     def validate(self, archive_path: Path) -> None:
         archive = WpressArchive(archive_path)
@@ -396,6 +413,14 @@ class PurePythonWpressExtractor(WpressExtractor):
 
         total = archive.size
         last_report = 0.0
+
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        pool = ThreadPoolExecutor(max_workers=self.workers, thread_name_prefix="wpress")
+        pending: list = []
+        budget = threading.Semaphore(max(1, self._QUEUED_BYTES // self._POOLED_MAX))
+        counters = threading.Lock()
 
         with archive.path.open("rb") as fh:
             offset = 0
@@ -433,7 +458,23 @@ class PurePythonWpressExtractor(WpressExtractor):
                     fh.seek(offset)
                     continue
 
-                if self._write_member(fh, entry, target, result) is None:
+                if entry.size <= self._POOLED_MAX:
+                    payload = fh.read(entry.size)
+                    if len(payload) < entry.size:
+                        result.truncated = True
+                        result.add_warning(
+                            f"member {entry.archive_path!r} is truncated: "
+                            f"{entry.size - len(payload)} of {entry.size} bytes missing"
+                        )
+                        break
+                    budget.acquire()
+                    pending.append(pool.submit(
+                        self._write_payload, payload, entry, target, result, counters, budget
+                    ))
+                    # Keep the pending list from growing for the whole archive.
+                    if len(pending) >= 512:
+                        pending = [f for f in pending if not f.done()]
+                elif self._write_member(fh, entry, target, result) is None:
                     break  # truncated payload; _write_member recorded the warning
 
                 offset = entry.offset + entry.size
@@ -445,6 +486,8 @@ class PurePythonWpressExtractor(WpressExtractor):
                         last_report = now
                         progress(min(offset, total), total, str(entry.safe_path))
 
+        # Every queued file must be on disk before the result is reported.
+        pool.shutdown(wait=True)
         result.duration_seconds = time.monotonic() - started
         if result.files_written == 0:
             detail = (
@@ -462,6 +505,33 @@ class PurePythonWpressExtractor(WpressExtractor):
         return result
 
     # -- internals ----------------------------------------------------------
+    def _write_payload(self, payload: bytes, entry: WpressEntry, target: Path,
+                       result: ExtractionResult, counters, budget) -> None:
+        """Write one small file. Runs in the worker pool."""
+        try:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(payload)
+            except OSError as exc:
+                # A path the OS still rejects (too long, bad codepoint) costs
+                # us one file, not the job.
+                with counters:
+                    result.entries_skipped += 1
+                    result.add_warning(f"could not write {entry.archive_path!r}: {exc}")
+                return
+
+            if self.preserve_mtime and entry.mtime > 0:
+                try:
+                    os.utime(target, (entry.mtime, entry.mtime))
+                except OSError:
+                    pass  # cosmetic only
+
+            with counters:
+                result.files_written += 1
+                result.bytes_written += entry.size
+        finally:
+            budget.release()
+
     def _write_member(self, fh, entry: WpressEntry, target: Path, result: ExtractionResult):
         """Stream one payload to disk. Returns ``None`` when the archive ended early."""
         target.parent.mkdir(parents=True, exist_ok=True)

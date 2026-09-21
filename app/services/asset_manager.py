@@ -174,18 +174,22 @@ class AssetManager:
     def register_network_resources(self, resources) -> int:
         """Register assets Chromium actually requested while rendering.
 
-        This is what catches JavaScript-injected assets, which no amount of HTML
-        parsing would find.
+        This is what catches JavaScript-injected assets, which no amount of
+        HTML parsing would find. What counts as an asset is decided by
+        request_policy, the same rules the renderer uses to block traffic, so
+        the two can never disagree.
         """
+        from app.services.request_policy import RequestAction, classify_request
+
         added = 0
         for resource in resources:
-            if resource.resource_type in {"document", "xhr", "fetch", "websocket",
-                                          "eventsource", "ping", "manifest"}:
-                # Documents are pages, and XHR/fetch responses are data for a
-                # backend that will not exist; neither is a static asset.
-                if resource.resource_type != "manifest":
-                    continue
             if resource.failed or (resource.status or 0) >= 400:
+                continue
+            action = classify_request(
+                resource.url, resource.resource_type,
+                download_media=self.options.download_media,
+            )
+            if action is not RequestAction.SAVE:
                 continue
             if self.register(resource.url, content_type=resource.content_type, source="network"):
                 added += 1

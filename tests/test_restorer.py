@@ -283,3 +283,110 @@ def test_table_prefix_detection(tmp_path: Path, sql: bytes, expected: str):
     dump = tmp_path / "database.sql"
     dump.write_bytes(sql)
     assert detect_table_prefix(dump) == expected
+
+
+# ---------------------------------------------------------------------------
+# A backup that does not contain the site's theme
+# ---------------------------------------------------------------------------
+class _FakeCursor:
+    def __init__(self, rows): self.rows = rows
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def execute(self, *args, **kwargs): pass
+    def fetchall(self): return self.rows
+    def fetchone(self): return self.rows[0] if self.rows else None
+
+
+class _FakeConnection:
+    def __init__(self, rows): self.rows = rows
+    def __enter__(self): return self
+    def __exit__(self, *exc): return False
+    def cursor(self): return _FakeCursor(self.rows)
+
+
+class _FakeServer:
+    def __init__(self, rows): self.rows = rows
+    def connect(self, database=None): return _FakeConnection(self.rows)
+
+
+def test_intended_theme_is_found_even_when_its_files_are_missing(monkeypatch):
+    """The whole export looks wrong if this goes unnoticed."""
+    from app.services import wordpress_restorer as restorer
+
+    server = _FakeServer([("theme_mods_provetta",), ("theme_mods_twentytwentyfour",)])
+    monkeypatch.setattr(restorer, "read_option", lambda *a, **k: "Provetta")
+
+    slug, label = restorer._intended_theme(
+        server, "db", "wp_", installed={"twentytwentyfour": {"theme_name": "Twenty Twenty-Four"}}
+    )
+    assert slug == "provetta", "the site's own theme must win over a bundled default"
+    assert label == "Provetta"
+
+
+def test_a_configured_custom_theme_wins_over_bundled_defaults(monkeypatch):
+    from app.services import wordpress_restorer as restorer
+
+    server = _FakeServer([("theme_mods_twentytwentythree",), ("theme_mods_acme-child",)])
+    monkeypatch.setattr(restorer, "read_option", lambda *a, **k: "")
+
+    slug, _ = restorer._intended_theme(server, "db", "wp_", installed={})
+    assert slug == "acme-child"
+
+
+# ---------------------------------------------------------------------------
+# Finding the real wp-content
+# ---------------------------------------------------------------------------
+def test_a_caching_plugins_mirror_does_not_win_over_the_real_site(tmp_path: Path):
+    """WP Rocket stores minified copies under cache/min/1/wp-content/...
+
+    Restoring that instead of the site leaves an install with no theme, which
+    still renders -- with WordPress's default theme, looking nothing like the
+    original. This is exactly what happened on a real backup.
+    """
+    from app.services.wordpress_restorer import inspect_archive
+
+    root = tmp_path / "extracted"
+    for folder in ("themes/acme", "plugins/elementor", "uploads/2026/01"):
+        (root / folder).mkdir(parents=True)
+    (root / "themes/acme/style.css").write_text("/* Theme Name: Acme */")
+    (root / "database.sql").write_text("-- dump")
+
+    decoy = root / "cache" / "min" / "1" / "wp-content" / "themes" / "acme"
+    decoy.mkdir(parents=True)
+    (decoy / "theme.min.css").write_text("body{}")
+
+    layout = inspect_archive(root)
+    assert layout.wp_content == root, "the site itself must win over a cache mirror"
+
+
+def test_a_real_wp_content_wrapper_is_preferred_over_the_root(tmp_path: Path):
+    from app.services.wordpress_restorer import inspect_archive
+
+    root = tmp_path / "extracted"
+    content = root / "wp-content"
+    for folder in ("themes/acme", "plugins/x", "uploads"):
+        (content / folder).mkdir(parents=True)
+    (root / "database.sql").write_text("-- dump")
+
+    layout = inspect_archive(root)
+    assert layout.wp_content == content
+
+
+# ---------------------------------------------------------------------------
+# "No plugins recorded" must include an empty list
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("raw", [None, "", "a:0:{}", "[]", "{}"])
+def test_an_empty_plugin_list_counts_as_not_recorded(raw):
+    """A site whose header and footer are Elementor templates renders as a
+    bare theme when its plugins stay off, which looks like a conversion fault
+    but is a restore one."""
+    from app.services.wordpress_restorer import _no_plugins_recorded
+
+    assert _no_plugins_recorded(raw) is True
+
+
+def test_a_real_plugin_list_is_left_alone():
+    from app.services.wordpress_restorer import _no_plugins_recorded
+
+    recorded = 'a:2:{i:0;s:19:"elementor/elementor.php";i:1;s:9:"akismet/akismet.php";}'
+    assert _no_plugins_recorded(recorded) is False

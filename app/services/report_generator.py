@@ -73,6 +73,10 @@ class ReportData:
     missing_assets: list[dict] = field(default_factory=list)
     console_errors: list[dict] = field(default_factory=list)
     visual: dict = field(default_factory=dict)
+    stage_timings: dict = field(default_factory=dict)
+    """Seconds spent in each stage of the job."""
+    render_timings: dict = field(default_factory=dict)
+    """Average seconds per page in each render phase."""
     quality: dict = field(default_factory=dict)
     """Problems, source issues and self-repairs; see app.services.quality."""
 
@@ -327,6 +331,44 @@ def render_report(data: ReportData) -> str:
         data.failed_urls, ("URL", "Error"), ("url", "error")
     )
 
+    # -- timings ------------------------------------------------------------
+    _STAGE_NAMES = {
+        "EXTRACTING": "Extract the backup",
+        "RESTORING": "Restore WordPress and rewrite URLs",
+        "STARTING_WORDPRESS": "Start WordPress",
+        "DISCOVERING_URLS": "Find pages",
+        "RENDERING": "Render pages in a browser",
+        "GENERATING_HTML": "Generate the HTML files",
+        "DOWNLOADING_ASSETS": "Collect assets",
+        "VALIDATING": "Check the export",
+        "ZIPPING": "Package the ZIP",
+    }
+    if data.stage_timings:
+        total = sum(data.stage_timings.values()) or 1
+        rows = "".join(
+            f"<tr><td>{_e(_STAGE_NAMES.get(name, name))}</td>"
+            f"<td class='num'>{_duration(seconds)}</td>"
+            f"<td class='num'>{seconds / total * 100:.0f}%</td></tr>"
+            for name, seconds in sorted(
+                data.stage_timings.items(), key=lambda kv: kv[1], reverse=True
+            )
+        )
+        timings_html = (
+            "<table><thead><tr><th>Step</th><th class='num'>Time</th>"
+            f"<th class='num'>Share</th></tr></thead><tbody>{rows}</tbody></table>"
+        )
+        if data.render_timings:
+            phases = ", ".join(
+                f"{name} {value:.1f}s" for name, value in data.render_timings.items()
+                if name != "total"
+            )
+            timings_html += (
+                f"<p class='sub'>Average per page while rendering: {_e(phases)} "
+                f"(total {data.render_timings.get('total', 0):.1f}s per page).</p>"
+            )
+    else:
+        timings_html = '<p class="empty">No step timings were recorded.</p>'
+
     # -- visual -------------------------------------------------------------
     if data.visual and data.visual.get("pages_compared"):
         visual = data.visual
@@ -462,6 +504,9 @@ def render_report(data: ReportData) -> str:
 <h2>Browser validation</h2>
 <h3>Console errors</h3>
 {console_html}
+
+<h2>Where the time went</h2>
+{timings_html}
 
 <h2>Visual comparison</h2>
 {visual_html}

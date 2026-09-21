@@ -80,7 +80,12 @@ class ArchiveLayout:
     home_url: str | None = None
     wordpress_version: str | None = None
     site_name: str | None = None
+    stylesheet: str | None = None
+    """The active theme's folder, as package.json records it."""
+    template: str | None = None
+    """Its parent theme's folder, for a child theme."""
     plugins: list[str] = field(default_factory=list)
+    """The plugins that were active on the source site."""
     is_multisite: bool = False
     warnings: list[str] = field(default_factory=list)
 
@@ -90,6 +95,57 @@ class ArchiveLayout:
             return None
         candidate = self.wp_content / "uploads"
         return candidate if candidate.is_dir() else None
+
+
+#: What a real ``wp-content`` holds. Used to score candidates, because the
+#: name alone proves nothing: caching plugins mirror the whole path inside
+#: their own folders, so a backup can contain
+#: ``cache/min/1/wp-content/themes/...`` holding a handful of minified files.
+#: Restoring that instead of the site leaves an install with no theme, which
+#: still renders -- with WordPress's default theme, looking nothing like the
+#: original.
+_CONTENT_MARKERS = ("themes", "plugins", "uploads", "mu-plugins")
+
+
+def _content_score(path: Path) -> int:
+    """How much of a real wp-content this directory looks like."""
+    if not path.is_dir():
+        return 0
+    return sum(1 for name in _CONTENT_MARKERS if (path / name).is_dir())
+
+
+def _find_wp_content(root: Path) -> Path | None:
+    """The directory holding the site's themes, plugins and uploads.
+
+    Some exports wrap them in ``wp-content``; others put them at the top
+    level. Whichever it is, the one that *contains the site* wins over one
+    that merely carries the right name.
+    """
+    candidates: list[tuple[int, int, Path]] = []
+    for depth in range(0, 4):
+        pattern = "wp-content" if depth == 0 else "/".join(["*"] * depth) + "/wp-content"
+        for candidate in root.glob(pattern):
+            if candidate.is_dir():
+                candidates.append((_content_score(candidate), -depth, candidate))
+
+    best = max(candidates) if candidates else None
+    root_score = _content_score(root)   # an archive with no wrapper at all
+
+    if best and best[0] >= max(root_score, 1):
+        return best[2]
+    if root_score:
+        return root
+    if best:
+        return best[2]
+
+    # Nothing named wp-content and nothing at the top level: look a little
+    # deeper for the markers themselves.
+    for depth in range(1, 4):
+        for marker in _CONTENT_MARKERS:
+            for found in root.glob("/".join(["*"] * depth) + f"/{marker}"):
+                if found.is_dir():
+                    return found.parent
+    return None
 
 
 def inspect_archive(extracted_root: Path) -> ArchiveLayout:
@@ -120,16 +176,7 @@ def inspect_archive(extracted_root: Path) -> ArchiveLayout:
     layout.package_json = shallow_find("package.json")
     layout.multisite_json = shallow_find("multisite.json")
 
-    wp_content = shallow_find("wp-content")
-    if wp_content and wp_content.is_dir():
-        layout.wp_content = wp_content
-    else:
-        # An archive may carry themes/plugins/uploads without the wrapper.
-        for marker in ("themes", "plugins", "uploads"):
-            found = shallow_find(marker)
-            if found and found.is_dir():
-                layout.wp_content = found.parent
-                break
+    layout.wp_content = _find_wp_content(root)
 
     # When the archive has no wp-content wrapper, wp_content *is* the extraction
     # root, so the install root to probe for core is the root itself -- not its
@@ -181,6 +228,12 @@ def _read_package_metadata(layout: ArchiveLayout) -> None:
     layout.site_url = data.get("SiteURL") or data.get("siteurl") or None
     layout.home_url = data.get("HomeURL") or data.get("homeurl") or layout.site_url
     layout.site_name = data.get("Name") or data.get("name")
+
+    # All-in-One WP Migration strips the theme and plugin options out of the
+    # database but records them here, which makes package.json the only
+    # reliable statement of what the site was actually running.
+    layout.stylesheet = data.get("Stylesheet") or data.get("stylesheet") or None
+    layout.template = data.get("Template") or data.get("template") or layout.stylesheet
 
     version = data.get("WordPress")
     if isinstance(version, dict):
@@ -1119,6 +1172,8 @@ def import_sql_dump(
     *,
     client_binary: Path | None = None,
     progress: ProgressCallback | None = None,
+    workers: int = 1,
+    should_stop=None,
 ) -> int:
     """Import *sql_dump* into *database*. Returns the number of statements run.
 
@@ -1135,12 +1190,185 @@ def import_sql_dump(
     logger.info("importing %s (%.1f MiB) into %s", sql_dump.name, size / 1048576, database)
 
     if client_binary and Path(client_binary).is_file():
+        client = Path(client_binary)
+        # Several connections only pay off on a dump big enough to matter.
+        if workers > 1 and size > 64 * 1024 * 1024:
+            try:
+                return _import_in_parallel(
+                    sql_dump, server, database, client, workers, progress, should_stop
+                )
+            except (RestoreError, OSError) as exc:
+                logger.warning(
+                    "parallel import failed (%s); retrying through one connection", exc
+                )
         try:
-            return _import_with_client(sql_dump, server, database, Path(client_binary), progress)
+            return _import_with_client(sql_dump, server, database, client, progress)
         except RestoreError as exc:
             logger.warning("client import failed (%s); falling back to the Python importer", exc)
 
     return _import_with_python(sql_dump, server, database, progress)
+
+
+#: The statement a dump line starts, and the table it touches. Dumps escape
+#: newlines inside values, so a statement never spans lines by accident --
+#: which is what makes routing by line safe and fast. A line that does not end
+#: a statement is still buffered until it does.
+_STATEMENT_TABLE = re.compile(
+    rb"^\s*(?:INSERT(?:\s+IGNORE)?\s+INTO|REPLACE\s+INTO|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?"
+    rb"|DROP\s+TABLE(?:\s+IF\s+EXISTS)?|ALTER\s+TABLE|LOCK\s+TABLES|TRUNCATE(?:\s+TABLE)?)"
+    rb"\s+`?([^`\s(;]+)`?",
+    re.IGNORECASE,
+)
+
+
+#: Tables whose *contents* no static export can use: request logs, firewall
+#: hits, scheduled-task history, session stores. On a busy site these are
+#: routinely most of the dump. Their structure is still created, so any plugin
+#: that queries them during rendering finds an empty table rather than an error.
+_SKIP_CONTENT_TABLES = re.compile(
+    rb"(actionscheduler_(logs|actions)|wfhits|wflogs|wfblocks7|wffilemods|wfnotifications"
+    rb"|wfstatus|wfissues|wfconfig|wp_statistics_(visitor|visit|pages|search)"
+    rb"|litespeed_(url|img_optm|crawler)|redirection_(logs|404)|wc_sessions|woocommerce_sessions"
+    rb"|wp_session|popularpostsdata|popularpostssummary|aiowps_events|aiowps_failed_logins"
+    rb"|wpforms_tasks_meta|simple_history|edd_sessions)",
+    re.IGNORECASE,
+)
+
+
+def _skips_content(table: bytes | None) -> bool:
+    return bool(table and _SKIP_CONTENT_TABLES.search(table))
+
+
+def _table_of(line: bytes) -> bytes | None:
+    match = _STATEMENT_TABLE.match(line)
+    return match.group(1).lower() if match else None
+
+
+def _import_in_parallel(
+    sql_dump: Path, server, database: str, client: Path, workers: int,
+    progress: ProgressCallback | None, should_stop=None,
+) -> int:
+    """Import a dump through several database connections at once.
+
+    One connection means one CPU core doing the work while the rest idle, and
+    on a multi-gigabyte WordPress dump that is the single longest step of a
+    conversion. Each table is sent to one client and always the same one, so
+    the statements for a table still arrive in their original order; different
+    tables simply load side by side. Statements that belong to no table -- the
+    session settings a dump opens with -- go to every client.
+    """
+    import subprocess
+    import tempfile
+
+    total = max(1, sql_dump.stat().st_size)
+    processes, errors, stdins = [], [], []
+    try:
+        for _ in range(workers):
+            err = tempfile.TemporaryFile()
+            proc = subprocess.Popen(
+                _client_command(server, database, client),
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=err,
+                shell=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            processes.append(proc)
+            errors.append(err)
+            stdins.append(proc.stdin)
+
+        assigned: dict[bytes, int] = {}
+        pending = bytearray()
+        sent = 0
+        skipped_bytes = 0
+        next_worker = 0
+
+        with sql_dump.open("rb") as source:
+            for line in source:
+                sent += len(line)
+                pending += line
+                if not line.rstrip().endswith(b";"):
+                    continue  # statement continues on the next line
+
+                statement = bytes(pending)
+                pending.clear()
+
+                table = _table_of(statement)
+                if table is not None and _skips_content(table) and not statement.lstrip()[:6].upper().startswith((b"CREATE", b"DROP")):
+                    skipped_bytes += len(statement)
+                    continue
+                if table is None:
+                    for stdin in stdins:      # session settings, comments, USE
+                        stdin.write(statement)
+                else:
+                    if table not in assigned:
+                        # Round robin rather than a hash: it spreads a dump of
+                        # a few big tables evenly, which hashing does not.
+                        assigned[table] = next_worker % workers
+                        next_worker += 1
+                    stdins[assigned[table]].write(statement)
+
+                if progress and sent % (8 * 1024 * 1024) < 4096:
+                    progress(f"Importing database ({sent / 1048576:,.0f} of "
+                             f"{total / 1048576:,.0f} MiB)", sent / total)
+                if should_stop is not None and should_stop():
+                    raise RewriteCancelled("cancelled during the database import")
+
+            if pending:
+                for stdin in stdins:
+                    stdin.write(bytes(pending))
+
+        for stdin in stdins:
+            stdin.close()
+        for proc in processes:
+            proc.wait(timeout=3 * 3600)
+
+        problems = []
+        for proc, err in zip(processes, errors):
+            err.seek(0)
+            text = err.read().decode("utf-8", errors="replace")
+            for line in text.splitlines()[:10]:
+                if line.strip() and "insecure passwordless login" not in line:
+                    logger.warning("import: %s", line.strip())
+            if proc.returncode != 0 and "ERROR" in text.upper():
+                problems.append(text[-600:])
+        if problems:
+            raise RestoreError("the database client reported: " + " | ".join(problems))
+
+        if skipped_bytes:
+            logger.info(
+                "import: skipped %.0f MiB of plugin log and session tables "
+                "(their structure was still created)", skipped_bytes / 1048576,
+            )
+        if progress:
+            progress("Database imported", 1.0)
+        return -1
+    except BaseException:
+        for proc in processes:
+            if proc.poll() is None:
+                proc.kill()
+        raise
+    finally:
+        for err in errors:
+            err.close()
+
+
+def _client_command(server, database: str, client: Path) -> list[str]:
+    command = [
+        str(client),
+        f"--host={server.host}",
+        f"--port={server.port}",
+        f"--user={server.user}",
+        "--binary-mode",           # dumps can contain binary blobs
+        "--default-character-set=utf8mb4",
+        "--max-allowed-packet=512M",
+        "--force",                 # one bad statement must not abort the import
+        # A dump is internally consistent, so checking every row against
+        # unique and foreign keys as it lands is wasted work. Autocommit stays
+        # on: turning it off would roll everything back when the client exits.
+        "--init-command=SET SESSION unique_checks=0, foreign_key_checks=0",
+        database,
+    ]
+    if server.password:
+        command.insert(4, f"--password={server.password}")
+    return command
 
 
 def _import_with_client(
@@ -1462,6 +1690,15 @@ def replace_urls_in_database(
     return report
 
 
+#: Marks a value as PHP-serialized: a string, array or object whose byte
+#: length is written next to it. Replacing a URL inside such a value changes
+#: that length, so those rows have to be rewritten one at a time in Python.
+#: Everything else -- post content, Elementor's JSON, plain settings -- can be
+#: rewritten by the database itself, which is far faster than fetching every
+#: row into this process and sending it back.
+_SERIALIZED_MARKER = r'(s|a|O):[0-9]+:("|{)'
+
+
 def _replace_in_table(conn, database: str, table: str, replacements: dict[str, str],
                       report: ReplacementReport, should_stop=None) -> None:
     with conn.cursor() as cur:
@@ -1483,24 +1720,42 @@ def _replace_in_table(conn, database: str, table: str, replacements: dict[str, s
         logger.debug("table %s has no primary key; leaving it untouched", table)
         return
 
-    key_list = ", ".join(f"`{k}`" for k in primary_keys)
+    skip_revisions = _skip_revisions(conn, table, [c[0] for c in columns])
 
-    # Only read rows that can possibly contain one of the search terms. The
-    # condition and its parameters are built in one pass so they cannot drift
-    # out of order.
+    # -- the fast path: let the database rewrite its own plain text ---------
+    for column in text_columns:
+        for search, replace in replacements.items():
+            if should_stop is not None and should_stop():
+                raise RewriteCancelled("cancelled during the URL rewrite")
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"UPDATE `{table}` SET `{column}` = REPLACE(`{column}`, %s, %s) "
+                        f"WHERE `{column}` LIKE %s AND `{column}` NOT REGEXP %s{skip_revisions}",
+                        (search, replace, f"%{search}%", _SERIALIZED_MARKER),
+                    )
+                    report.rows_updated += cur.rowcount or 0
+                    report.replacements += cur.rowcount or 0
+            except Exception as exc:
+                # Fall back to the row-by-row path for this column rather than
+                # losing the table: correctness first, speed second.
+                logger.debug("bulk replace failed on %s.%s: %s", table, column, exc)
+
+    # -- the careful path: serialized values, row by row --------------------
+    key_list = ", ".join(f"`{k}`" for k in primary_keys)
     conditions: list[str] = []
     like_params: list[str] = []
     for column in text_columns:
         for needle in replacements:
-            conditions.append(f"`{column}` LIKE %s")
-            like_params.append(f"%{needle}%")
+            conditions.append(f"(`{column}` LIKE %s AND `{column}` REGEXP %s)")
+            like_params.extend([f"%{needle}%", _SERIALIZED_MARKER])
     where_any = " OR ".join(conditions)
 
     select_columns = ", ".join(f"`{c}`" for c in text_columns)
     with conn.cursor() as cur:
         cur.execute(
             f"SELECT {key_list}, {select_columns} FROM `{table}` "
-            f"WHERE ({where_any}){_skip_revisions(conn, table, [c[0] for c in columns])}",
+            f"WHERE ({where_any}){skip_revisions}",
             like_params,
         )
         rows = cur.fetchall()
@@ -1573,6 +1828,44 @@ def _table_exists(conn, table: str) -> bool:
 _ACTIVATION_OPTIONS = ("stylesheet", "template", "active_plugins")
 
 
+def _intended_theme(server, database: str, table_prefix: str,
+                    installed: dict[str, dict]) -> tuple[str | None, str]:
+    """The theme the source site was using, from what the database remembers.
+
+    ``theme_mods_<slug>`` rows name every theme that was ever configured, and
+    ``current_theme`` holds the display name of the one in use. Neither needs
+    the theme's files to be present, which is exactly the case that matters.
+    """
+    current = (read_option(server, database, table_prefix, "current_theme") or "").strip()
+
+    slugs: list[str] = []
+    try:
+        with server.connect(database) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"SELECT option_name FROM `{table_prefix}options` "
+                "WHERE option_name LIKE 'theme_mods_%'"
+            )
+            slugs = [name[len("theme_mods_"):] for (name,) in cur.fetchall()]
+    except Exception as exc:
+        logger.debug("could not read theme_mods options: %s", exc)
+
+    # The display name is the strongest signal: match it against the slugs.
+    if current:
+        simplified = re.sub(r"[^a-z0-9]", "", current.lower())
+        for slug in slugs:
+            if re.sub(r"[^a-z0-9]", "", slug.lower()) == simplified:
+                return slug, current
+        for slug, headers in installed.items():
+            if headers.get("theme_name", "").strip().lower() == current.lower():
+                return slug, current
+
+    # Otherwise prefer a configured theme that is not a bundled default.
+    custom = [s for s in slugs if not s.startswith("twenty")]
+    if custom:
+        return custom[0], current or custom[0]
+    return (slugs[0], current or slugs[0]) if slugs else (None, current)
+
+
 def _read_theme_headers(style_css: Path) -> dict[str, str]:
     """Parse the header block at the top of a theme's ``style.css``."""
     try:
@@ -1585,6 +1878,20 @@ def _read_theme_headers(style_css: Path) -> dict[str, str]:
         if match:
             headers[field_name.lower().replace(" ", "_")] = match.group(1).strip()
     return headers
+
+
+def _no_plugins_recorded(raw: object) -> bool:
+    """Whether the backup carries no usable list of active plugins."""
+    if not raw:
+        return True
+    text = str(raw).strip()
+    if text in {"a:0:{}", "[]", "{}"}:
+        return True
+    try:
+        value = loads(text)
+    except (PhpSerializationError, ValueError, TypeError):
+        return False
+    return not value
 
 
 def _discover_plugin_entrypoints(plugins_dir: Path) -> list[str]:
@@ -1629,9 +1936,9 @@ def _discover_plugin_entrypoints(plugins_dir: Path) -> list[str]:
     return entries
 
 
-def repair_activation_state(
+def repair_activation_state(  # noqa: PLR0912 - one decision per source of truth
     server, database: str, table_prefix: str, wordpress_root: Path
-) -> list[str]:
+, recorded: ArchiveLayout | None = None) -> list[str]:
     """Restore the active theme and plugin list that the export left out.
 
     Returns human-readable notes for the conversion report. Does nothing when
@@ -1654,6 +1961,26 @@ def repair_activation_state(
         if d.is_dir() and (d / "style.css").is_file()
     } if themes_dir.is_dir() else {}
 
+    intended, intended_label = _intended_theme(server, database, table_prefix, installed)
+    if recorded is not None and recorded.stylesheet:
+        # package.json states the theme outright; nothing guesses better.
+        intended, intended_label = recorded.stylesheet, recorded.stylesheet
+    if intended and intended not in installed:
+        # The site's own theme is not in the backup. Every page will render
+        # with a stand-in theme, so the export cannot look like the original:
+        # the header, footer, fonts and colours are the theme's, and any
+        # content type the theme registers will 404. This is the loudest
+        # signal the restore can give, because everything downstream looks
+        # superficially fine -- pages render, links resolve, screenshots even
+        # match, since both sides use the same wrong theme.
+        notes.append(
+            f"MISSING-THEME: the backup does not contain the site's theme "
+            f"({intended_label or intended}). Only these themes are present: "
+            f"{', '.join(sorted(installed)) or 'none'}. The export will not look like the "
+            "original site. Re-export the backup with themes included "
+            "(in All-in-One WP Migration, do not tick 'Do not export themes')."
+        )
+
     stylesheet = present.get("stylesheet")
     if not stylesheet or stylesheet not in installed:
         chosen = None
@@ -1673,6 +2000,9 @@ def repair_activation_state(
                         break
         except Exception as exc:
             logger.debug("could not read theme_mods options: %s", exc)
+
+        if not chosen and recorded is not None and recorded.stylesheet in installed:
+            chosen = recorded.stylesheet
 
         # Otherwise match the human-readable name WordPress also stores.
         if not chosen:
@@ -1709,7 +2039,12 @@ def repair_activation_state(
             )
 
     # ---- plugins ----------------------------------------------------------
-    if not present.get("active_plugins"):
+    # An empty list counts as "not recorded". All-in-One WP Migration strips
+    # the option, and some exports leave it as a serialized empty array; a
+    # site whose header, footer and page layouts are Elementor templates
+    # renders as a bare theme without its plugins, which looks like a
+    # conversion fault but is a restore one.
+    if _no_plugins_recorded(present.get("active_plugins")):
         entries = _discover_plugin_entrypoints(wordpress_root / "wp-content" / "plugins")
 
         # A plugin the owner recently switched off should stay off.
@@ -1726,15 +2061,36 @@ def repair_activation_state(
                 pass
 
         activate = [e for e in entries if e not in deactivated]
+
+        # The backup records exactly which plugins were running. Activating
+        # everything installed instead switches on plugins the site had
+        # deliberately disabled -- an abandoned page-builder add-on years out
+        # of step with the builder itself can stop whole sections rendering.
+        if recorded is not None and recorded.plugins:
+            wanted = {str(p).strip().lstrip("/") for p in recorded.plugins if p}
+            by_directory = {e.split("/", 1)[0]: e for e in entries}
+            matched = [e for e in entries if e in wanted]
+            for name in wanted:
+                directory = name.split("/", 1)[0]
+                if name not in entries and directory in by_directory:
+                    # Same plugin, different main file (a version suffix, or a
+                    # renamed entry point).
+                    matched.append(by_directory[directory])
+            if matched:
+                activate = [e for e in dict.fromkeys(matched) if e not in deactivated]
         if activate:
             serialised = dumps({index: value for index, value in enumerate(activate)})
             set_option(
                 server, database, table_prefix, "active_plugins",
                 serialised.decode("utf-8", "surrogateescape"),
             )
+            from_record = bool(recorded is not None and recorded.plugins)
             notes.append(
-                f"The backup did not record which plugins were active, so all "
-                f"{len(activate)} installed plugin(s) were activated"
+                (f"The database recorded no active plugins; the backup's package.json "
+                 f"lists {len(activate)} that were running, and those were activated"
+                 if from_record else
+                 f"Neither the database nor the backup's metadata recorded which plugins "
+                 f"were active, so all {len(activate)} installed plugin(s) were activated")
                 + (f" ({len(deactivated)} recently-deactivated one(s) left off)"
                    if deactivated else "")
                 + ". A page builder such as Elementor cannot render its pages "
@@ -1809,6 +2165,27 @@ def deactivate_problem_plugins(server, database: str, table_prefix: str) -> list
         "redirection": "may redirect local URLs back to the live domain",
     }
 
+    # Plugins that do their work in the dashboard and contribute nothing to a
+    # rendered page. Leaving them on costs time on every single page -- and on
+    # a large site that is the difference between a page building in seconds
+    # and timing out -- without changing a pixel of the result.
+    admin_only = {
+        "all-in-one-wp-migration": "backup tool: dashboard only",
+        "updraftplus": "backup tool: dashboard only",
+        "duplicator": "backup tool: dashboard only",
+        "better-search-replace": "database tool: dashboard only",
+        "wp-optimize": "database cleaner: dashboard only",
+        "wp-sweep": "database cleaner: dashboard only",
+        "duplicate-post": "editing helper: dashboard only",
+        "wp-mail-smtp": "email delivery: nothing to render",
+        "akismet": "comment spam checking: nothing to render",
+        "classic-editor": "editing helper: dashboard only",
+        "regenerate-thumbnails": "media tool: dashboard only",
+        "wordpress-importer": "import tool: dashboard only",
+        "query-monitor": "developer tool: adds output to every page",
+    }
+    disruptive.update(admin_only)
+
     raw = read_option(server, database, table_prefix, "active_plugins")
     if not raw:
         return []
@@ -1829,7 +2206,13 @@ def deactivate_problem_plugins(server, database: str, table_prefix: str) -> list
     for key, value in active.items():
         entry = value.decode("utf-8", "replace") if isinstance(value, bytes) else str(value)
         directory = entry.split("/", 1)[0]
-        reason = disruptive.get(directory)
+        # Folder names often carry a version, as in
+        # all-in-one-wp-migration-6.77, so match on the prefix.
+        reason = disruptive.get(directory) or next(
+            (why for name, why in disruptive.items()
+             if directory.startswith(name + "-") or directory.startswith(name + ".")),
+            None,
+        )
         if reason:
             notes.append(f"Deactivated {directory} for the render ({reason}).")
         else:

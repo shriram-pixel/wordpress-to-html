@@ -110,6 +110,8 @@ class PipelineContext:
     asset_manager: AssetManager | None = None
     renderer: object = None
     """The live BrowserRenderer, so a cancel can close it immediately."""
+    render_timings: list[dict] = field(default_factory=list)
+    """One entry per rendered page: where its time went."""
     render_page_errors: dict[str, list[str]] = field(default_factory=dict)
     """Page URL -> JavaScript errors the *original* page threw while rendering.
     An export that throws the same error is faithful, not broken."""
@@ -165,6 +167,7 @@ class ConversionPipeline:
             flat=not job.options.preserve_url_structure,
             folder_links=job.options.folder_links,
         )
+        self._timed_stage: tuple[str, float] | None = None
         self._stage_failures: list[dict] = []
         """Best-effort stages that crashed; reported as problems."""
         self._file_logger = self._setup_file_logging()
@@ -183,11 +186,28 @@ class ConversionPipeline:
         logging.getLogger("app").addHandler(handler)
         return handler
 
+    def _close_stage_timing(self) -> None:
+        """Record how long the stage that is ending took.
+
+        Without this, comparing two runs means reading two logs side by side,
+        and a step that quietly got slower -- as the URL rewrite did when it
+        gained escaped-URL patterns -- goes unnoticed.
+        """
+        if not self._timed_stage:
+            return
+        name, started = self._timed_stage
+        seconds = round(time.monotonic() - started, 1)
+        timings = self.context.report.stage_timings
+        timings[name] = round(timings.get(name, 0.0) + seconds, 1)
+        self._timed_stage = None
+
     def _teardown_file_logging(self) -> None:
         logging.getLogger("app").removeHandler(self._file_logger)
         self._file_logger.close()
 
     def _stage(self, status: JobStatus, message: str = "") -> None:
+        self._close_stage_timing()
+        self._timed_stage = (str(status), time.monotonic())
         self.job.status = status
         self.job.stage_progress = 0.0
         self.job.stage_detail = message
@@ -661,6 +681,15 @@ class ConversionPipeline:
             self._stage_failures.append({"kind": "stage-error", "message": message, "examples": []})
 
     def _finish(self, status: JobStatus, error: str = "", instructions: str = "") -> None:
+        self._close_stage_timing()
+        if self.context.report.stage_timings:
+            self._log(
+                "TIMING",
+                "; ".join(
+                    f"{name.lower().replace('_', ' ')} {value:.0f}s"
+                    for name, value in self.context.report.stage_timings.items()
+                ),
+            )
         # Capture how far the job actually got before the status flips to a
         # terminal one, so a failure reports its real progress.
         reached = self.job.overall_progress
@@ -709,6 +738,8 @@ class ConversionPipeline:
             "zip_name": report.zip_name,
             "zip_bytes": report.zip_bytes,
             "visual": report.visual,
+            "stage_timings": report.stage_timings,
+            "render_timings": report.render_timings,
             "problems": len((report.quality or {}).get("problems", [])),
             "source_issues": len((report.quality or {}).get("source_issues", [])),
             "repaired": (report.quality or {}).get("repaired_count", 0),
@@ -918,6 +949,9 @@ class ConversionPipeline:
             layout.sql_dump, mysql, context.database,
             client_binary=context.runtimes.mysql.client_binary,
             progress=lambda message, fraction: self._progress(message, 0.68 + fraction * 0.18),
+            # One connection loads a multi-gigabyte dump on a single core.
+            workers=max(1, min(4, self.capacity.cpus)),
+            should_stop=self._cancel_check,
         )
         self._log("RESTORE", f"imported {layout.sql_dump.name}")
         self._release_extracted_tree()
@@ -979,15 +1013,14 @@ class ConversionPipeline:
         # this an All-in-One WP Migration backup restores with no active theme
         # and no active plugins, and renders every page blank.
         notes = restorer.repair_activation_state(
-            mysql, context.database, context.table_prefix, self.workspace.wordpress
+            mysql, context.database, context.table_prefix, self.workspace.wordpress,
+            recorded=context.layout,
         )
         notes += restorer.configure_for_static_export(
             mysql, context.database, context.table_prefix, context.base_url
         )
         notes += restorer.deactivate_problem_plugins(mysql, context.database, context.table_prefix)
-        for note in notes:
-            self._log("RESTORE", note)
-            context.report.notes.append(note)
+        self._record_restore_notes(notes, "RESTORE")
 
         self.job.stage_progress = 1.0
 
@@ -1043,15 +1076,34 @@ class ConversionPipeline:
                 self._log("RESUME", f"URL rewrite skipped a table: {error}", "WARN")
 
         notes = restorer.repair_activation_state(
-            mysql, context.database, context.table_prefix, self.workspace.wordpress
+            mysql, context.database, context.table_prefix, self.workspace.wordpress,
+            recorded=context.layout,
         )
         notes += restorer.configure_for_static_export(
             mysql, context.database, context.table_prefix, context.base_url
         )
         notes += restorer.deactivate_problem_plugins(mysql, context.database, context.table_prefix)
+        self._record_restore_notes(notes, "RESUME")
+
+    def _record_restore_notes(self, notes: list[str], tag: str) -> None:
+        """Log what the restore repaired, and promote the serious findings.
+
+        A note prefixed MISSING-THEME means the export cannot look like the
+        original site. That is not something to leave in a list of footnotes:
+        everything downstream looks fine -- pages render, links resolve, the
+        screenshots even match, because both sides use the same wrong theme.
+        """
         for note in notes:
-            self._log("RESUME", note)
-            context.report.notes.append(note)
+            if note.startswith("MISSING-THEME: "):
+                message = note[len("MISSING-THEME: "):]
+                self._log("PROBLEM", message, "ERROR")
+                self.context.report.warnings.append(message)
+                self._stage_failures.append(
+                    {"kind": "missing-theme", "message": message, "examples": []}
+                )
+            else:
+                self._log(tag, note)
+                self.context.report.notes.append(note)
 
     def _release_extracted_tree(self) -> None:
         """Delete what is left of the extracted archive once it is no longer needed.
@@ -1273,7 +1325,7 @@ class ConversionPipeline:
                     output_path = context.asset_map.add_page(record.url)
                     raw_path = raw_dir / (_safe_name(record.url, context.base_url) + ".html")
                     atomic_write_bytes(raw_path, page.html.encode("utf-8", errors="surrogatepass"))
-                    _save_resources(raw_path, page.resources)
+                    _save_resources(raw_path, page.resources, page.page_errors)
 
                     async with lock:
                         if len(context.html_samples) < 12:
@@ -1283,6 +1335,8 @@ class ConversionPipeline:
                         # asset manager exists.
                         context.network_resources[record.url] = list(page.resources)
                         context.render_page_errors[record.url] = list(page.page_errors)
+                        if page.timings:
+                            context.render_timings.append(page.timings)
 
                     self.store.update_url(
                         self.job.id, record.url,
@@ -1340,6 +1394,14 @@ class ConversionPipeline:
             f"rendered {context.report.urls_rendered:,} page(s), "
             f"{context.report.urls_failed} failed",
         )
+        breakdown = _average_timings(context.render_timings)
+        if breakdown:
+            context.report.render_timings = breakdown
+            self._log(
+                "RENDER",
+                "average time per page: "
+                + ", ".join(f"{name} {value:.1f}s" for name, value in breakdown.items()),
+            )
 
     async def _fetch_raw_document(self, record: UrlRecord) -> None:
         """Copy a non-HTML document (sitemap, robots, feed) into the export."""
@@ -1403,11 +1465,14 @@ class ConversionPipeline:
         # lists saved beside each captured page.
         for record in records:
             if record.url not in context.network_resources:
-                saved = _load_resources(
-                    raw_dir / (_safe_name(record.url, context.base_url) + ".html")
-                )
+                raw_path = raw_dir / (_safe_name(record.url, context.base_url) + ".html")
+                saved = _load_resources(raw_path)
                 if saved:
                     context.network_resources[record.url] = saved
+                if record.url not in context.render_page_errors:
+                    errors = _load_page_errors(raw_path)
+                    if errors:
+                        context.render_page_errors[record.url] = errors
         for resources in context.network_resources.values():
             context.asset_manager.register_network_resources(resources)
         # Script chunks a page builder loads only on demand (a carousel's code
@@ -1567,6 +1632,7 @@ class ConversionPipeline:
         assessment = quality.Assessment()
         validation = None
         browser = None
+        sampled_pages: list[str] = []
 
         if self.options.validate_links:
             self._progress("Checking links and assets", 0.05)
@@ -1600,7 +1666,7 @@ class ConversionPipeline:
 
         if self.options.check_console_errors:
             self._progress("Loading representative pages in a browser", 0.25)
-            pages = await asyncio.to_thread(self._representative_pages, 25, 3)
+            pages = sampled_pages = await asyncio.to_thread(self._representative_pages, 25, 3)
             browser = ValidationReport()
             await validate_in_browser(output, pages, self.options, browser, limit=len(pages))
 
@@ -1638,6 +1704,10 @@ class ConversionPipeline:
                 "INFO" if not browser.page_errors else "WARN",
             )
 
+        self._progress("Comparing each page with what the browser captured", 0.45)
+        sample = sampled_pages or await asyncio.to_thread(self._representative_pages, 12, 2)
+        structural = await asyncio.to_thread(self._compare_structure, sample)
+
         self._progress("Looking for links to servers that will not exist", 0.5)
         leftovers = await asyncio.to_thread(
             quality.scan_leftovers, output, context.site_hosts,
@@ -1647,6 +1717,12 @@ class ConversionPipeline:
         )
 
         self._assess(assessment, validation, browser, leftovers)
+        if structural:
+            assessment.add_problem(
+                "missing-content",
+                f"{len(structural)} page(s) are missing content that the browser captured",
+                structural,
+            )
 
         if self.options.screenshot_comparison:
             await self._compare_screenshots()
@@ -1671,6 +1747,50 @@ class ConversionPipeline:
             self._log("QUALITY", "no conversion problems found"
                       + (f" ({len(assessment.source_issues)} issue(s) in the source site itself)"
                          if assessment.source_issues else ""))
+
+    def _compare_structure(self, pages: list[str]) -> list[str]:
+        """Check each sampled page against the DOM the browser captured.
+
+        Links resolving and pixels matching still leave a gap: a section that
+        failed to survive the rewrite, or a gallery that lost its images. This
+        counts what a reader would see -- images, links, headings, list items,
+        tables, forms and text -- in the captured page and in the exported one.
+        """
+        context = self.context
+        raw_dir = self.workspace.root / "rendered"
+        by_path = {
+            path: url for url, path in context.asset_map.pages.items() if path.endswith(".html")
+        }
+
+        differences: list[str] = []
+        for path in pages:
+            url = by_path.get(path)
+            exported = self.workspace.output / path
+            if not url or not exported.is_file():
+                continue
+            captured_file = raw_dir / (_safe_name(url, context.base_url) + ".html")
+            if not captured_file.is_file():
+                continue
+            try:
+                captured = quality.structural_signature(
+                    captured_file.read_text(encoding="utf-8", errors="replace")
+                )
+                produced = quality.structural_signature(
+                    exported.read_text(encoding="utf-8", errors="replace")
+                )
+            except OSError:
+                continue
+            for line in quality.compare_structure(captured, produced):
+                differences.append(f"{path}: {line}")
+        if differences:
+            self._log(
+                "VALIDATE",
+                f"{len(differences)} structural difference(s) between captured and exported pages",
+                "WARN",
+            )
+        else:
+            self._log("VALIDATE", f"{len(pages)} page(s) match the captured original structurally")
+        return differences
 
     def _static_target(self, failed: dict) -> str | None:
         """The output path a request to the validation server was for."""
@@ -1890,6 +2010,19 @@ def _read_configured_prefix(wordpress_root: Path) -> str:
     return match.group(1) if match else ""
 
 
+def _average_timings(entries: list[dict]) -> dict[str, float]:
+    """Mean seconds per phase across every rendered page."""
+    if not entries:
+        return {}
+    totals: dict[str, float] = {}
+    for entry in entries:
+        for name, value in entry.items():
+            totals[name] = totals.get(name, 0.0) + float(value)
+    average = {name: round(total / len(entries), 2) for name, total in totals.items()}
+    average["total"] = round(sum(average.values()), 2)
+    return average
+
+
 def _normalise_error(text: str) -> str:
     """A JavaScript error with addresses and line numbers removed, so the same
     error thrown by the original and by the export compares equal."""
@@ -1903,35 +2036,60 @@ def _resources_path(raw_path: Path) -> Path:
     return raw_path.with_name(raw_path.stem + ".resources.json")
 
 
-def _save_resources(raw_path: Path, resources) -> None:
-    """Keep what the browser fetched for a page next to its captured DOM."""
+def _save_resources(raw_path: Path, resources, page_errors=()) -> None:
+    """Keep what the browser fetched, and what the page threw, beside its DOM.
+
+    The errors matter as much as the files: an export is only at fault for a
+    JavaScript error the *original* page did not also throw, and without this
+    a resumed job has nothing to compare against and reports the site's own
+    errors as conversion problems.
+    """
     import json
 
-    rows = [
-        {"url": r.url, "status": r.status, "content_type": r.content_type,
-         "resource_type": r.resource_type, "failed": r.failed}
-        for r in resources
-    ]
+    payload = {
+        "resources": [
+            {"url": r.url, "status": r.status, "content_type": r.content_type,
+             "resource_type": r.resource_type, "failed": r.failed}
+            for r in resources
+        ],
+        "page_errors": list(page_errors or []),
+    }
     try:
-        atomic_write_text(_resources_path(raw_path), json.dumps(rows))
+        atomic_write_text(_resources_path(raw_path), json.dumps(payload))
     except OSError as exc:
-        logger.warning("could not save the resource list for %s: %s", raw_path.name, exc)
+        logger.warning("could not save the capture record for %s: %s", raw_path.name, exc)
 
 
-def _load_resources(raw_path: Path) -> list:
+def _read_capture(raw_path: Path) -> dict:
     import json
-
-    from app.services.browser_renderer import NetworkResource
 
     path = _resources_path(raw_path)
     if not path.is_file():
-        return []
+        return {}
     try:
-        rows = json.loads(path.read_text(encoding="utf-8"))
-        return [NetworkResource(**row) for row in rows]
-    except (OSError, ValueError, TypeError) as exc:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
         logger.warning("could not read %s: %s", path.name, exc)
+        return {}
+    # Files written before page errors were saved hold a bare list.
+    if isinstance(data, list):
+        return {"resources": data, "page_errors": []}
+    return data if isinstance(data, dict) else {}
+
+
+def _load_resources(raw_path: Path) -> list:
+    from app.services.browser_renderer import NetworkResource
+
+    rows = _read_capture(raw_path).get("resources") or []
+    try:
+        return [NetworkResource(**row) for row in rows]
+    except TypeError as exc:
+        logger.warning("unusable resource list beside %s: %s", raw_path.name, exc)
         return []
+
+
+def _load_page_errors(raw_path: Path) -> list[str]:
+    return [str(e) for e in (_read_capture(raw_path).get("page_errors") or [])]
 
 
 def _is_raw_document(url: str) -> bool:
