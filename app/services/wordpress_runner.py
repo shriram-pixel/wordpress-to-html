@@ -442,7 +442,8 @@ class PhpServer:
         logger.info("PHP server ready at %s", self.base_url)
 
     def wait_until_wordpress_responds(
-        self, timeout: float = 180.0, expected_status: tuple[int, ...] = (200, 301, 302)
+        self, timeout: float = 180.0, expected_status: tuple[int, ...] = (200, 301, 302),
+        should_stop=None,
     ) -> tuple[bool, str]:
         """Poll the home page until WordPress renders something real.
 
@@ -454,7 +455,9 @@ class PhpServer:
                 return f"the PHP server exited with code {self.process.returncode}"
             return None
 
-        return _wait_for_wordpress(self.base_url, problem, self.tail_log, timeout, expected_status)
+        return _wait_for_wordpress(
+            self.base_url, problem, self.tail_log, timeout, expected_status, should_stop
+        )
 
     def tail_log(self, lines: int = 40) -> str:
         if not self.log_path or not Path(self.log_path).exists():
@@ -483,7 +486,9 @@ class PhpServer:
         self.stop()
 
 
-def _wait_for_wordpress(base_url, problem, tail_log, timeout, expected_status) -> tuple[bool, str]:
+def _wait_for_wordpress(
+    base_url, problem, tail_log, timeout, expected_status, should_stop=None
+) -> tuple[bool, str]:
     """Poll the home page until WordPress renders something real.
 
     An open port is not enough: WordPress may still be erroring on a database
@@ -500,7 +505,14 @@ def _wait_for_wordpress(base_url, problem, tail_log, timeout, expected_status) -
         reason = problem()
         if reason:
             return False, f"{reason}\n{tail_log()}"
+        if should_stop is not None and should_stop():
+            return False, "cancelled while waiting for WordPress"
         remaining = max(5.0, deadline - time.monotonic())
+        # A single request cannot be interrupted, so when a cancel is possible
+        # it is capped: the wait as a whole still runs to the deadline, but a
+        # cancel is noticed in between rather than up to 15 minutes later.
+        if should_stop is not None:
+            remaining = min(remaining, 20.0)
         try:
             # The first request after a restore is genuinely slow -- WordPress
             # and page builders rebuild caches, per-page CSS and search indexes
@@ -772,7 +784,8 @@ class PhpServerPool:
         logger.info("PHP pool ready at %s (%d workers)", self.base_url, count)
 
     def wait_until_wordpress_responds(
-        self, timeout: float = 180.0, expected_status: tuple[int, ...] = (200, 301, 302)
+        self, timeout: float = 180.0, expected_status: tuple[int, ...] = (200, 301, 302),
+        should_stop=None,
     ) -> tuple[bool, str]:
         def problem() -> str | None:
             dead = [s for s in self.servers if s.process is not None and s.process.poll() is not None]
@@ -780,7 +793,9 @@ class PhpServerPool:
                 return "every PHP worker has exited"
             return None
 
-        return _wait_for_wordpress(self.base_url, problem, self.tail_log, timeout, expected_status)
+        return _wait_for_wordpress(
+            self.base_url, problem, self.tail_log, timeout, expected_status, should_stop
+        )
 
     def tail_log(self, lines: int = 40) -> str:
         return "\n".join(

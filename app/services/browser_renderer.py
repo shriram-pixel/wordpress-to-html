@@ -368,11 +368,31 @@ class BrowserRenderer:
         self._browser = None
         self._context = None
         self._semaphore = asyncio.Semaphore(max(1, options.render_concurrency))
+        self._aborted = False
+
+    def abort(self) -> None:
+        """Close the browser from another thread, so pages in flight fail now.
+
+        Every page waiting on the network or on a settle delay raises as soon
+        as its context disappears, which is what makes a cancel feel immediate
+        rather than "some time within the next minute".
+        """
+        self._aborted = True
+        browser = self._browser
+        if browser is None:
+            return
+        try:
+            loop = getattr(self, "_loop", None)
+            if loop is not None and loop.is_running():
+                asyncio.run_coroutine_threadsafe(browser.close(), loop)
+        except Exception as exc:
+            logger.debug("error closing the browser on abort: %s", exc)
 
     # -- lifecycle ----------------------------------------------------------
     async def __aenter__(self) -> "BrowserRenderer":
         from playwright.async_api import async_playwright
 
+        self._loop = asyncio.get_running_loop()
         self._playwright = await async_playwright().start()
         self._browser = await self._playwright.chromium.launch(
             headless=True,

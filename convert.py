@@ -1,19 +1,3 @@
-"""Convert a ``.wpress`` backup from the command line, without uploading it.
-
-The web interface has to receive the backup over HTTP, which means the file
-exists twice before any work starts: once in the web framework's temporary
-staging area and once inside the job workspace. On a 3 GB backup that is 6 GB
-of pure duplication, and on a 10 GB one it is 20 GB.
-
-This entry point runs the identical pipeline against the file where it already
-sits. Nothing is copied, nothing is staged, and the conversion starts
-immediately.
-
-    python convert.py C:\\backups\\site.wpress
-    python convert.py site.wpress -o D:\\exports --no-media
-    python convert.py site.wpress --tags --authors --concurrency 5
-"""
-
 from __future__ import annotations
 
 import argparse

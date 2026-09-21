@@ -67,6 +67,13 @@ class ConversionCancelled(Exception):
     """The job was cancelled by the user."""
 
 
+def _as_cancellation(exc: Exception) -> Exception:
+    """Map a stage's own "stop" exception onto the pipeline's."""
+    if isinstance(exc, restorer.RewriteCancelled):
+        return ConversionCancelled("cancelled by the user")
+    return exc
+
+
 class ConversionFailed(Exception):
     """The job cannot continue.
 
@@ -101,6 +108,8 @@ class PipelineContext:
 
     asset_map: AssetMap = field(default_factory=AssetMap)
     asset_manager: AssetManager | None = None
+    renderer: object = None
+    """The live BrowserRenderer, so a cancel can close it immediately."""
     render_page_errors: dict[str, list[str]] = field(default_factory=dict)
     """Page URL -> JavaScript errors the *original* page threw while rendering.
     An export that throws the same error is faithful, not broken."""
@@ -136,6 +145,7 @@ class ConversionPipeline:
         self.settings = settings
         self.options = job.options
         self._cancel_check = cancel_check or (lambda: False)
+        self._aborting = False
 
         self.workspace = JobWorkspace.create(settings.job_dir(job.id))
         self.context = PipelineContext(
@@ -237,6 +247,35 @@ class ConversionPipeline:
         if self._cancel_check():
             raise ConversionCancelled("cancelled by the user")
 
+    def _cancelled_now(self) -> bool:
+        """Whether a failure was really a cancellation.
+
+        Aborting closes the database, the PHP workers and the browser, so the
+        work in flight fails on its way down. Those errors are the cancel, not
+        a fault, and must not be reported as one.
+        """
+        return self._aborting or self._cancel_check()
+
+    def abort(self) -> None:
+        """Stop the work now, from another thread.
+
+        Cancelling used to mean "raise at the next progress report", which on
+        a silent step -- waiting for WordPress's first page, rewriting a large
+        table, a page still loading -- left the user watching a button that
+        appeared to do nothing for minutes. Shutting the database, the PHP
+        pool and the browser down makes whatever is in flight fail at once,
+        and the pipeline then unwinds through its normal cancelled path.
+        """
+        self._aborting = True
+        self._log("CANCELLED", "stopping the servers and the browser", "WARN")
+        try:
+            self.context.stop_servers()
+        except Exception:
+            logger.debug("error stopping servers on abort", exc_info=True)
+        renderer = self.context.renderer
+        if renderer is not None:
+            renderer.abort()
+
     # -- entry point --------------------------------------------------------
     def run(self, archive_path: Path) -> Path:
         """Run the whole pipeline. Returns the path to the finished ZIP."""
@@ -264,16 +303,24 @@ class ConversionPipeline:
             self._finish(JobStatus.COMPLETED)
             return zip_path
 
-        except ConversionCancelled:
+        except (ConversionCancelled, restorer.RewriteCancelled):
             self._log("CANCELLED", "the job was cancelled", "WARN")
             self._finish(JobStatus.CANCELLED, "cancelled by the user")
-            raise
+            raise ConversionCancelled("cancelled by the user") from None
         except (ConversionFailed, RuntimeUnavailable) as exc:
+            if self._cancelled_now():
+                self._log("CANCELLED", "the job was cancelled", "WARN")
+                self._finish(JobStatus.CANCELLED, "cancelled by the user")
+                raise ConversionCancelled("cancelled by the user") from None
             instructions = getattr(exc, "instructions", "")
             self._log("FAILED", str(exc), "ERROR", instructions)
             self._finish(JobStatus.FAILED, str(exc), instructions)
             raise
         except Exception as exc:
+            if self._cancelled_now():
+                self._log("CANCELLED", "the job was cancelled", "WARN")
+                self._finish(JobStatus.CANCELLED, "cancelled by the user")
+                raise ConversionCancelled("cancelled by the user") from None
             logger.exception("unexpected failure in job %s", self.job.id)
             self._log("FAILED", f"{type(exc).__name__}: {exc}", "ERROR")
             self._finish(JobStatus.FAILED, f"{type(exc).__name__}: {exc}")
@@ -462,7 +509,10 @@ class ConversionPipeline:
             )
             php.start()
             context.php = php
-            ok, detail = php.wait_until_wordpress_responds(timeout=900)
+            ok, detail = php.wait_until_wordpress_responds(
+                timeout=900, should_stop=self._cancel_check
+            )
+            self._check_cancelled()
             if not ok:
                 raise ConversionFailed(f"the restored WordPress did not come back up: {detail[:600]}")
             self._log(
@@ -547,11 +597,23 @@ class ConversionPipeline:
             zip_path = self._stage_package()
             self._finish(JobStatus.COMPLETED)
             return zip_path
+        except restorer.RewriteCancelled:
+            self._log("CANCELLED", "the job was cancelled", "WARN")
+            self._finish(JobStatus.CANCELLED, "cancelled by the user")
+            raise ConversionCancelled("cancelled by the user") from None
         except (ConversionFailed, RuntimeUnavailable) as exc:
+            if self._cancelled_now():
+                self._log("CANCELLED", "the job was cancelled", "WARN")
+                self._finish(JobStatus.CANCELLED, "cancelled by the user")
+                raise ConversionCancelled("cancelled by the user") from None
             self._log("FAILED", str(exc), "ERROR", getattr(exc, "instructions", ""))
             self._finish(JobStatus.FAILED, str(exc), getattr(exc, "instructions", ""))
             raise
         except Exception as exc:
+            if self._cancelled_now():
+                self._log("CANCELLED", "the job was cancelled", "WARN")
+                self._finish(JobStatus.CANCELLED, "cancelled by the user")
+                raise ConversionCancelled("cancelled by the user") from None
             logger.exception("resume failed for job %s", self.job.id)
             self._log("FAILED", f"{type(exc).__name__}: {exc}", "ERROR")
             self._finish(JobStatus.FAILED, f"{type(exc).__name__}: {exc}")
@@ -901,6 +963,7 @@ class ConversionPipeline:
             report = restorer.replace_urls_in_database(
                 mysql, context.database, replacements,
                 progress=lambda message, fraction: self._progress(message, 0.88 + fraction * 0.1),
+                should_stop=self._cancel_check,
             )
             self._log(
                 "RESTORE",
@@ -969,6 +1032,7 @@ class ConversionPipeline:
             report = restorer.replace_urls_in_database(
                 mysql, context.database, ordered,
                 progress=lambda message, fraction: self._progress(message, 0.9 + fraction * 0.08),
+                should_stop=self._cancel_check,
             )
             self._log(
                 "RESUME",
@@ -1035,7 +1099,10 @@ class ConversionPipeline:
         context.php = php
 
         self._progress("Waiting for WordPress to respond", 0.4)
-        ok, detail = php.wait_until_wordpress_responds(timeout=900)
+        ok, detail = php.wait_until_wordpress_responds(
+            timeout=900, should_stop=self._cancel_check
+        )
+        self._check_cancelled()
         if not ok:
             raise ConversionFailed(
                 f"the restored WordPress did not respond: {detail[:800]}",
@@ -1144,6 +1211,7 @@ class ConversionPipeline:
             retries=self.settings.page_retries,
             document_root=self.workspace.wordpress,
         ) as renderer:
+            context.renderer = renderer
 
             for depth in range(self.options.max_crawl_depth + 1):
                 pending = [

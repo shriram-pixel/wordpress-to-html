@@ -592,9 +592,22 @@
   async function cancelJob() {
     if (!state.jobId) return;
     if (!confirm('Cancel this conversion?')) return;
+
+    // Say so immediately. Stopping the database, the PHP workers and the
+    // browser takes a few seconds, and a button that looks inert in the
+    // meantime reads as broken.
+    var button = el('cancel-btn');
+    button.disabled = true;
+    text(button, 'Cancelling…');
+    var pill = el('job-status');
+    pill.className = 'status-pill cancelling';
+    text(pill, 'CANCELLING');
+
     try {
       await api('/api/jobs/' + state.jobId + '/cancel', { method: 'POST' });
     } catch (e) {
+      button.disabled = false;
+      text(button, 'Cancel');
       alert('Could not cancel: ' + e.message);
     }
   }

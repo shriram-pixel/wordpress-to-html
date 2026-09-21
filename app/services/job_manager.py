@@ -32,6 +32,8 @@ class RunningJob:
     job_id: str
     future: Future
     cancel_event: threading.Event = field(default_factory=threading.Event)
+    pipeline: object = None
+    """The live pipeline, so a cancel can stop its servers and browser now."""
     started_at: float = field(default_factory=time.time)
 
 
@@ -108,12 +110,19 @@ class JobManager:
         pipeline = ConversionPipeline(
             job, self.store, self.settings, cancel_check=cancel_event.is_set
         )
+        self._attach(job.id, pipeline)
         try:
             pipeline.run_resume(port=port, archive=archive_path, folders=folders)
         except ConversionCancelled:
             logger.info("job %s was cancelled", job.id)
         except Exception:
             logger.exception("resume of job %s failed", job.id)
+
+    def _attach(self, job_id: str, pipeline) -> None:
+        with self._lock:
+            running = self._running.get(job_id)
+            if running is not None:
+                running.pipeline = pipeline
 
     def _forget(self, job_id: str) -> None:
         with self._lock:
@@ -123,6 +132,7 @@ class JobManager:
         pipeline = ConversionPipeline(
             job, self.store, self.settings, cancel_check=cancel_event.is_set
         )
+        self._attach(job.id, pipeline)
         try:
             pipeline.run(archive_path)
         except ConversionCancelled:
@@ -147,6 +157,19 @@ class JobManager:
                     error="cancelled before it started",
                 )
                 self._forget(job_id)
+                logger.info("cancelled job %s before it started", job_id)
+                return True
+            pipeline = running.pipeline
+
+        # Outside the lock: shutting servers and the browser down takes a
+        # moment, and nothing else should wait for it. This is what makes
+        # cancelling take effect straight away instead of at the next
+        # checkpoint, which on a silent step can be minutes away.
+        if pipeline is not None:
+            try:
+                pipeline.abort()
+            except Exception:
+                logger.debug("error while aborting job %s", job_id, exc_info=True)
         logger.info("cancellation requested for job %s", job_id)
         return True
 

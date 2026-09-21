@@ -1411,12 +1411,17 @@ class ReplacementReport:
     errors: list[str] = field(default_factory=list)
 
 
+class RewriteCancelled(Exception):
+    """The caller asked the URL rewrite to stop."""
+
+
 def replace_urls_in_database(
     server,
     database: str,
     replacements: dict[str, str],
     *,
     progress: ProgressCallback | None = None,
+    should_stop=None,
 ) -> ReplacementReport:
     """Apply *replacements* across every text column, safe for serialized data.
 
@@ -1438,10 +1443,12 @@ def replace_urls_in_database(
             tables = [row[0] for row in cur.fetchall()]
 
         for index, table in enumerate(tables):
+            if should_stop is not None and should_stop():
+                raise RewriteCancelled("cancelled during the URL rewrite")
             if progress:
                 progress(f"Rewriting URLs in {table}", (index + 1) / max(1, len(tables)))
             try:
-                _replace_in_table(conn, database, table, replacements, report)
+                _replace_in_table(conn, database, table, replacements, report, should_stop)
                 report.tables_scanned += 1
             except Exception as exc:
                 report.errors.append(f"{table}: {exc}")
@@ -1456,7 +1463,7 @@ def replace_urls_in_database(
 
 
 def _replace_in_table(conn, database: str, table: str, replacements: dict[str, str],
-                      report: ReplacementReport) -> None:
+                      report: ReplacementReport, should_stop=None) -> None:
     with conn.cursor() as cur:
         cur.execute(
             "SELECT column_name, data_type, column_key FROM information_schema.columns "
@@ -1505,7 +1512,12 @@ def _replace_in_table(conn, database: str, table: str, replacements: dict[str, s
     where_clause = " AND ".join(f"`{k}`=%s" for k in primary_keys)
 
     with conn.cursor() as cur:
-        for row in rows:
+        for number, row in enumerate(rows):
+            # The biggest tables hold hundreds of thousands of rows and take
+            # minutes; without a check here a cancel would not be noticed
+            # until the table finished.
+            if should_stop is not None and number % 200 == 0 and should_stop():
+                raise RewriteCancelled("cancelled during the URL rewrite")
             keys = row[:key_count]
             values = row[key_count:]
 
