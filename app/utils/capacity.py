@@ -106,9 +106,11 @@ class Capacity:
     parallel_jobs: int
 
     def describe(self) -> str:
+        # Spelled out, because "15.9 GiB RAM (5.9 GiB free)" reads like disk
+        # space to anyone watching a job that is filling a drive.
         return (
-            f"{self.cpus} CPU(s), {self.total_memory / _GIB:.1f} GiB RAM "
-            f"({self.available_memory / _GIB:.1f} GiB free): "
+            f"{self.cpus} CPU(s), {self.total_memory / _GIB:.1f} GiB memory of which "
+            f"{self.available_memory / _GIB:.1f} GiB is free (this is memory, not disk): "
             f"{self.render_concurrency} page(s) at a time, {self.php_workers} PHP worker(s), "
             f"{self.html_workers} HTML worker(s), {self.asset_concurrency} asset worker(s)"
         )

@@ -422,6 +422,12 @@
       log.appendChild(line);
     });
 
+    // A long conversion logs thousands of lines. Keeping them all makes the
+    // browser tab steadily heavier on the very machine doing the conversion;
+    // the full log is on disk and behind "View log" either way.
+    var extra = log.childElementCount - 400;
+    for (var i = 0; i < extra; i++) log.removeChild(log.firstChild);
+
     if (atBottom) log.scrollTop = log.scrollHeight;
   }
 
