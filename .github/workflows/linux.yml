@@ -40,7 +40,11 @@ jobs:
       # would otherwise stop a per-job database, and creates the virtualenv as
       # the invoking user rather than as root.
       - name: setup.sh
-        run: sudo ./setup.sh
+        # "bash ./setup.sh", not "./setup.sh": if the executable bit is ever
+        # lost again -- a fresh clone from a filesystem without one, a zip
+        # round trip -- sudo reports it as "command not found", which reads
+        # like a missing package rather than a missing permission.
+        run: sudo bash ./setup.sh
 
       - name: Dependencies are real (scripts/doctor.py)
         run: |

@@ -168,6 +168,19 @@ def init_command(monkeypatch, *, windows: bool) -> list[str]:
     return captured.get("command", [])
 
 
+def test_posix_install_db_is_not_given_the_windows_only_option(monkeypatch):
+    """--default-user belongs to mariadb-install-db.exe, not to the script.
+
+    The Linux script forwards options it does not know to mariadbd, so this
+    failed as "/usr/sbin/mariadbd: unknown option '--default-user'" -- which
+    points at the server, not at the flag, and not at this function at all.
+    Found by running on real Linux; no amount of reading had caught it.
+    """
+    command = init_command(monkeypatch, windows=False)
+
+    assert "--default-user" not in command
+
+
 def test_windows_install_db_is_not_given_posix_only_options(monkeypatch):
     """mariadb-install-db.exe is a different program from the shell script.
 
@@ -190,3 +203,16 @@ def test_posix_install_db_does_get_them(monkeypatch):
 
     assert "--no-defaults" in command
     assert any(a.startswith("--basedir") for a in command)
+
+
+def test_the_two_platforms_share_only_what_both_programs_accept(monkeypatch):
+    """One name, two programs, almost no options in common."""
+    windows = set(init_command(monkeypatch, windows=True))
+    posix = set(init_command(monkeypatch, windows=False))
+
+    shared = {a.split("=")[0] for a in windows & posix}
+    assert shared == {"--datadir", "mariadb-install-db"} - {"mariadb-install-db"} | {
+        a for a in shared if not a.startswith("--")
+    }, f"unexpected shared options: {shared}"
+    assert "--default-user" in windows and "--default-user" not in posix
+    assert "--no-defaults" in posix and "--no-defaults" not in windows

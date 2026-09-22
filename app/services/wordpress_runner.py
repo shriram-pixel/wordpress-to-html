@@ -25,6 +25,7 @@ gives real concurrency and removes the self-request deadlock on every platform.
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import platform
@@ -53,6 +54,63 @@ _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0) if _IS_WINDOWS else 0
 #: before its port opens, and the job reports only that the database did not
 #: start. Must be the first argument.
 _NO_SYSTEM_DEFAULTS = ("--no-defaults",)
+
+
+@functools.lru_cache(maxsize=8)
+def _supported_options(binary: str) -> frozenset[str]:
+    """Which ``--options`` a program advertises in its own help.
+
+    Asked, not assumed. One name -- ``mariadb-install-db`` -- is a C++ program
+    on Windows and a shell script on Linux, and they share almost nothing:
+    the .exe takes ``--default-user`` and rejects ``--no-defaults``; the script
+    is the exact reverse, and forwards anything it does not know to mariadbd,
+    so a wrong flag surfaces as "mariadbd: unknown option" and reads as though
+    the server were at fault.
+
+    Deciding from ``platform.system()`` has been wrong in both directions. The
+    program knows what it accepts, and versions differ too, so this asks it
+    once per binary and keeps the answer.
+    """
+    try:
+        proc = subprocess.run(
+            [binary, "--help"], capture_output=True, text=True, timeout=30,
+            shell=False, creationflags=_NO_WINDOW,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("could not read %s --help: %s", binary, exc)
+        return frozenset()
+    help_text = "\n".join((proc.stdout or "", proc.stderr or ""))
+    return frozenset(re.findall(r"--([a-z0-9][a-z0-9-]*)", help_text))
+
+
+def _install_db_command(binary: Path, data_dir: Path, base_dir: Path) -> list[str]:
+    """The command that creates a fresh data directory, for this binary.
+
+    ``--datadir`` is the one option every version of every variant takes; the
+    rest go in only when the program says it understands them.
+    """
+    supported = _supported_options(str(binary))
+    command = [str(binary)]
+
+    if supported:
+        # --no-defaults first, where it exists: it governs whether the others
+        # are read from a system config file at all.
+        if "no-defaults" in supported:
+            command.append("--no-defaults")
+        command.append(f"--datadir={data_dir}")
+        if "basedir" in supported:
+            command.append(f"--basedir={base_dir}")
+        if "default-user" in supported:
+            command.append("--default-user")
+        return command
+
+    # The program would not say. Fall back to what each platform needs, which
+    # is what this did before it learned to ask.
+    logger.warning("%s did not report its options; assuming the %s defaults",
+                   binary.name, "Windows" if _IS_WINDOWS else "POSIX")
+    if _IS_WINDOWS:
+        return command + [f"--datadir={data_dir}", "--default-user"]
+    return command + ["--no-defaults", f"--datadir={data_dir}", f"--basedir={base_dir}"]
 
 
 class ServerStartupError(RuntimeError):
@@ -136,16 +194,10 @@ class MysqlServer:
         logger.info("initialising database data directory at %s", self.data_dir)
 
         if self.runtime.flavour == "mariadb" and self.runtime.install_db_binary:
-            command = [str(self.runtime.install_db_binary)]
-            if not _IS_WINDOWS:
-                # Windows ships mariadb-install-db.exe, a different program
-                # from the POSIX shell script: it takes neither --no-defaults
-                # nor --basedir and exits with "unknown option" on either. It
-                # has no system my.cnf to ignore, so it needs neither.
-                command.extend(_NO_SYSTEM_DEFAULTS)
-            command += [f"--datadir={self.data_dir}", "--default-user"]
-            if not _IS_WINDOWS:
-                command.append(f"--basedir={self.runtime.base_dir}")
+            command = _install_db_command(
+                Path(self.runtime.install_db_binary), self.data_dir,
+                self.runtime.base_dir,
+            )
         elif self.runtime.flavour == "mariadb":
             raise ServerStartupError(
                 "MariaDB is installed but mariadb-install-db was not found next to "
