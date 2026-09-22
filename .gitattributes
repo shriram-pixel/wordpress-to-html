@@ -1,0 +1,29 @@
+# Line endings.
+#
+# This repository is edited on Windows (core.autocrlf=true) and run on Linux.
+# A shell script checked out with CRLF has "#!/usr/bin/env bash\r" as its first
+# line, and the kernel then looks for an interpreter literally called "bash\r".
+# The error is "command not found", which sends you looking for a missing
+# package rather than a line ending.
+#
+# Normalise text in the repository, and pin LF for everything Linux executes.
+* text=auto
+
+*.sh        text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+.env.example text eol=lf
+
+# Windows-only scripts keep CRLF: PowerShell is fine either way, but a .bat
+# with LF endings can misbehave.
+*.ps1       text eol=crlf
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+
+# Never touch binaries.
+*.wpress    binary
+*.zip       binary
+*.png       binary
+*.jpg       binary
+*.woff2     binary
+*.pdf       binary
