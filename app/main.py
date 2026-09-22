@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from app.api import downloads, jobs
 from app.config import PROJECT_ROOT, get_settings
 from app.models.job import JobStore
+from app.services import estimator
 from app.services.job_manager import JobManager
 from app.utils import capacity
 
@@ -64,13 +65,31 @@ async def lifespan(app: FastAPI):
 
     store = JobStore(settings.database_path)
     machine = capacity.measure()
-    workers = settings.max_parallel_jobs or machine.parallel_jobs
-    logger.info("this machine: %s; %d job(s) at a time", machine.describe(), workers)
+
+    # The same sizing run_batch.py uses, rather than a second rule: selecting
+    # ten backups in the interface must convert them as fast as the command
+    # line would. The old limit here was two on any machine with eight cores,
+    # which on a sixteen-core server was half the throughput for no reason.
+    # Disk is left out because there is no batch to size against -- each job
+    # checks for its own space before it starts.
+    sized, per_job, _limits = estimator.size_batch(machine, free_disk=0, largest_backup=0)
+    workers = settings.max_parallel_jobs or sized
+    if settings.max_parallel_jobs:
+        # An explicit setting still gets a fair share of the page budget.
+        _, per_job, _ = estimator.size_batch(machine, 0, 0, parallel=workers)
+
+    logger.info("this machine: %s; %d job(s) at a time, %d page(s) each",
+                machine.describe(), workers, per_job)
     manager = JobManager(settings, store, max_workers=workers)
 
     app.state.settings = settings
     app.state.store = store
     app.state.manager = manager
+    app.state.machine = machine
+    #: Pages one job may render at once when several share the machine. Without
+    #: it every job measures the whole machine and claims all of it.
+    app.state.pages_per_job = per_job if workers > 1 else 0
+    app.state.max_parallel_jobs = workers
 
     recovered = manager.recover_orphans()
     if recovered:

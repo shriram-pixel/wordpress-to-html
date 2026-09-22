@@ -20,7 +20,11 @@
 
   var el = function (id) { return document.getElementById(id); };
   var state = { jobId: null, lastEventId: 0, timer: null, file: null,
-                source: 'local', localPath: null };
+                source: 'local', localPath: null,
+                // Paths ticked in the list, in the order they were ticked, and
+                // the jobs they became. One selection is the old behaviour;
+                // several become a batch that the server queues.
+                selected: [], batch: null, batchTimer: null };
 
   /* ------------------------------------------------------------------ utils */
   function bytes(n) {
@@ -145,7 +149,9 @@
     el('local-path').addEventListener('input', function () {
       var value = el('local-path').value.trim().replace(/^"|"$/g, '');
       state.localPath = value || null;
-      markSelected(null);
+      // Typing a path is a choice of one file, so it replaces any ticks.
+      state.selected = value ? [value] : [];
+      markSelected();
       refreshStartButton();
     });
     setSource('local');
@@ -165,10 +171,53 @@
     refreshStartButton();
   }
 
-  function markSelected(path) {
-    el('local-list').querySelectorAll('.backup-item').forEach(function (item) {
-      item.classList.toggle('selected', item.dataset.path === path);
+  /* ------------------------------------------------------------- selection */
+  function isSelected(path) { return state.selected.indexOf(path) !== -1; }
+
+  function toggleSelected(path) {
+    var at = state.selected.indexOf(path);
+    if (at === -1) state.selected.push(path);
+    else state.selected.splice(at, 1);
+    // The single-file path, the pasted-path box and the upload tab all still
+    // work off localPath; a selection of one keeps them in step.
+    state.localPath = state.selected.length === 1 ? state.selected[0] : null;
+    if (state.selected.length === 1) el('local-path').value = state.selected[0];
+    markSelected();
+    refreshStartButton();
+  }
+
+  function markSelected() {
+    var items = el('local-list').querySelectorAll('.backup-item');
+    items.forEach(function (item) {
+      var on = isSelected(item.dataset.path);
+      item.classList.toggle('selected', on);
+      item.setAttribute('aria-pressed', on ? 'true' : 'false');
+      var tick = item.querySelector('.tick');
+      if (tick) tick.checked = on;
     });
+
+    var all = el('select-all');
+    if (all) {
+      all.checked = items.length > 0 && state.selected.length === items.length;
+      all.indeterminate = state.selected.length > 0 && !all.checked;
+    }
+    var label = el('select-all-label');
+    if (label) {
+      label.textContent = state.selected.length
+        ? state.selected.length + ' selected'
+        : 'Select all';
+    }
+  }
+
+  function selectAll(on) {
+    state.selected = on
+      ? Array.prototype.map.call(
+          el('local-list').querySelectorAll('.backup-item'),
+          function (item) { return item.dataset.path; })
+      : [];
+    state.localPath = state.selected.length === 1 ? state.selected[0] : null;
+    markSelected();
+    refreshStartButton();
   }
 
   async function loadLocalBackups() {
@@ -196,21 +245,24 @@
         item.type = 'button';
         item.className = 'backup-item';
         item.dataset.path = file.path;
+        item.setAttribute('aria-pressed', 'false');
+        var tick = document.createElement('input');
+        tick.type = 'checkbox';
+        tick.className = 'tick';
+        tick.tabIndex = -1;            // the row itself is the control
+        tick.setAttribute('aria-hidden', 'true');
         var name = document.createElement('span');
         name.className = 'name';
         name.textContent = file.name;
         var meta = document.createElement('span');
         meta.className = 'meta';
         meta.textContent = bytes(file.bytes) + ' · ' + file.folder;
-        item.append(name, meta);
-        item.addEventListener('click', function () {
-          state.localPath = file.path;
-          el('local-path').value = file.path;
-          markSelected(file.path);
-          refreshStartButton();
-        });
+        item.append(tick, name, meta);
+        item.addEventListener('click', function () { toggleSelected(file.path); });
         list.appendChild(item);
       });
+      el('select-all-wrap').hidden = data.files.length < 2;
+      markSelected();
     } catch (e) {
       var message = document.createElement('p');
       message.className = 'muted';
@@ -238,11 +290,16 @@
 
   /* ---------------------------------------------------------------- submit */
   function canStart() {
-    return state.source === 'local' ? !!state.localPath : !!state.file;
+    if (state.source !== 'local') return !!state.file;
+    return state.selected.length > 0 || !!state.localPath;
   }
 
   function refreshStartButton() {
-    el('start-btn').disabled = !canStart() || !!state.timer;
+    var button = el('start-btn');
+    button.disabled = !canStart() || !!state.timer || !!state.batchTimer;
+    var many = state.source === 'local' && state.selected.length > 1;
+    text(button, many ? 'Convert ' + state.selected.length + ' backups'
+                      : 'Start conversion');
   }
 
   async function submitJob(event) {
@@ -252,6 +309,10 @@
     var button = el('start-btn');
     button.disabled = true;
     showError(null);
+
+    if (state.source === 'local' && state.selected.length > 1) {
+      return startBatch(state.selected.slice(), button);
+    }
 
     var created;
     try {
@@ -278,6 +339,171 @@
       button.disabled = false;
       text(button, 'Start conversion');
     }
+  }
+
+  /* ------------------------------------------------------------------ batch */
+  var FINISHED = { COMPLETED: 1, FAILED: 1, CANCELLED: 1 };
+
+  async function startBatch(paths, button) {
+    text(button, 'Queueing…');
+    el('queue-panel').hidden = false;
+    state.batch = { jobs: [], failed: [] };
+
+    // Submitted one at a time and in order, so the queue reads the way the
+    // list did, and so one rejected path (deleted, unreadable, no disk) is
+    // that one backup's problem rather than the batch's.
+    for (var i = 0; i < paths.length; i++) {
+      var path = paths[i];
+      var name = path.split(/[\\/]/).pop();
+      try {
+        var created = await api('/api/jobs/local', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ path: path, options: collectOptions() })
+        });
+        state.batch.jobs.push({ id: created.id, name: name, status: 'QUEUED', pct: 0 });
+      } catch (e) {
+        state.batch.failed.push({ name: name, why: e.message });
+      }
+      renderQueue();
+    }
+
+    text(button, 'Start conversion');
+    if (!state.batch.jobs.length) {
+      showError('None of the selected backups could be queued.');
+      refreshStartButton();
+      return;
+    }
+
+    selectAll(false);
+    loadHistory();
+    el('queue-panel').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    pollBatch();
+    state.batchTimer = setInterval(pollBatch, 2000);
+    refreshStartButton();
+  }
+
+  async function pollBatch() {
+    if (!state.batch) return;
+    var mine = {};
+    state.batch.jobs.forEach(function (job) { mine[job.id] = job; });
+
+    try {
+      var data = await api('/api/jobs?limit=100');
+      data.jobs.forEach(function (record) {
+        var job = mine[record.id];
+        if (!job) return;
+        job.status = record.status;
+        job.pct = Math.round((record.overall_progress || 0) * 100);
+        job.stage = record.stage_detail || '';
+        job.pages = record.summary && record.summary.pages;
+        job.problems = (record.summary && record.summary.problems) || 0;
+      });
+    } catch (e) {
+      return;                     // a missed poll is not worth reporting
+    }
+
+    renderQueue();
+    var done = state.batch.jobs.every(function (job) { return FINISHED[job.status]; });
+    if (done) {
+      clearInterval(state.batchTimer);
+      state.batchTimer = null;
+      refreshStartButton();
+      loadHistory();
+    }
+  }
+
+  function renderQueue() {
+    if (!state.batch) return;
+    var jobs = state.batch.jobs, list = el('queue');
+    list.innerHTML = '';
+
+    jobs.forEach(function (job, index) {
+      var row = document.createElement('li');
+      var running = !FINISHED[job.status];
+      row.className = job.status === 'COMPLETED' ? (job.problems ? 'warn' : 'done')
+                    : job.status === 'FAILED' ? 'bad'
+                    : job.status === 'CANCELLED' ? 'bad'
+                    : running && job.status !== 'QUEUED' ? 'running' : '';
+
+      var n = document.createElement('span');
+      n.className = 'n';
+      n.textContent = (index + 1) + '.';
+
+      var who = document.createElement('span');
+      who.className = 'who';
+      var nm = document.createElement('span');
+      nm.className = 'nm';
+      nm.textContent = job.name;
+      var st = document.createElement('span');
+      st.className = 'st';
+      st.textContent = job.status === 'COMPLETED'
+        ? (job.pages ? job.pages + ' pages' : 'finished') +
+          (job.problems ? ' · ' + job.problems + ' to look at' : '')
+        : (job.stage || job.status.toLowerCase().replace(/_/g, ' '));
+      who.append(nm, st);
+
+      if (running && job.status !== 'QUEUED') {
+        var bar = document.createElement('span');
+        bar.className = 'bar';
+        var fill = document.createElement('span');
+        fill.style.width = job.pct + '%';
+        bar.appendChild(fill);
+        who.appendChild(bar);
+      }
+
+      var right = document.createElement('span');
+      if (job.status === 'COMPLETED') {
+        right.className = 'links';
+        var zip = document.createElement('a');
+        zip.href = '/api/' + job.id + '/download';
+        zip.textContent = 'Download';
+        var report = document.createElement('a');
+        report.href = '/api/' + job.id + '/report';
+        report.target = '_blank';
+        report.rel = 'noopener';
+        report.textContent = 'Report';
+        right.append(zip, report);
+      } else {
+        right.className = 'pill';
+        right.textContent = job.status === 'QUEUED' ? 'waiting' : job.status.replace(/_/g, ' ');
+      }
+
+      row.append(n, who, right);
+      list.appendChild(row);
+    });
+
+    state.batch.failed.forEach(function (bad) {
+      var row = document.createElement('li');
+      row.className = 'bad';
+      row.innerHTML = '<span class="n">!</span><span class="who"><span class="nm"></span>' +
+                      '<span class="st"></span></span><span class="pill">rejected</span>';
+      row.querySelector('.nm').textContent = bad.name;
+      row.querySelector('.st').textContent = bad.why;
+      list.appendChild(row);
+    });
+
+    var finished = jobs.filter(function (j) { return FINISHED[j.status]; }).length;
+    text(el('queue-summary'), finished + ' of ' + jobs.length + ' finished');
+    el('queue-cancel').hidden = finished === jobs.length;
+    text(el('queue-note'), finished === jobs.length
+      ? 'All done. Each ZIP is on its row, and the reports say what needs a look.'
+      : 'Conversions run a few at a time; the rest wait their turn. Closing this ' +
+        'page does not stop them.');
+  }
+
+  async function cancelBatch() {
+    if (!state.batch) return;
+    el('queue-cancel').disabled = true;
+    for (var i = 0; i < state.batch.jobs.length; i++) {
+      var job = state.batch.jobs[i];
+      if (FINISHED[job.status]) continue;
+      try {
+        await api('/api/jobs/' + job.id + '/cancel', { method: 'POST' });
+      } catch (e) { /* already finished between poll and click */ }
+    }
+    el('queue-cancel').disabled = false;
+    pollBatch();
   }
 
   /* --------------------------------------------------------------- watching */
@@ -624,6 +850,8 @@
     initLocalSource();
     el('job-form').addEventListener('submit', submitJob);
     el('cancel-btn').addEventListener('click', cancelJob);
+    el('select-all').addEventListener('change', function () { selectAll(this.checked); });
+    el('queue-cancel').addEventListener('click', cancelBatch);
     el('refresh-history').addEventListener('click', loadHistory);
     checkHealth();
     loadHistory();

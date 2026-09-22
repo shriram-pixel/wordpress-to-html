@@ -17,8 +17,90 @@
       <p class="tagline">Restore a <code>.wpress</code> backup locally, render it, export a deployable site.</p>
     </div>
   </div>
-  <div id="health" class="health" role="status" aria-live="polite">Checking dependencies&hellip;</div>
+  <div class="topbar-actions">
+    <button type="button" class="ghost" id="calc-open">Calculate time</button>
+    <div id="health" class="health" role="status" aria-live="polite">Checking dependencies&hellip;</div>
+  </div>
 </header>
+
+<!-- ================= time calculator ================= -->
+<dialog id="calc" class="calc" aria-labelledby="calc-title">
+  <form method="dialog" class="calc-close-form">
+    <button class="calc-close" value="close" aria-label="Close">&times;</button>
+  </form>
+
+  <h2 id="calc-title">How long will it take?</h2>
+  <p class="calc-intro" id="calc-machine">Reading this machine&hellip;</p>
+
+  <div class="calc-body">
+    <div class="calc-fields">
+      <fieldset>
+        <legend>What you are converting</legend>
+        <label>Backups to convert
+          <input type="number" id="c-sites" min="1" max="1000" step="1" value="10">
+        </label>
+        <label>Pages per site
+          <input type="number" id="c-pages" min="1" max="100000" step="1" value="622">
+        </label>
+        <div class="from-backup">
+          <label class="stack" for="c-backup-pick">
+            <span>Don't know? Read it from a backup</span>
+            <select id="c-backup-pick">
+              <option value="">Choose a .wpress file&hellip;</option>
+            </select>
+          </label>
+          <p class="hint" id="c-backup-note"></p>
+        </div>
+        <label>Size of the largest backup <span class="unit">GB</span>
+          <input type="number" id="c-backup" min="0.1" max="500" step="0.1" value="2.9">
+        </label>
+        <label class="check">
+          <input type="checkbox" id="c-shots" checked>
+          Capture and compare screenshots
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>The machine
+          <button type="button" class="link" id="c-reset">use this one</button>
+        </legend>
+        <label>CPU cores
+          <input type="number" id="c-cpus" min="1" max="512" step="1">
+        </label>
+        <label>Memory <span class="unit">GB</span>
+          <input type="number" id="c-memory" min="1" max="4096" step="1">
+        </label>
+        <label>Free disk <span class="unit">GB</span>
+          <input type="number" id="c-disk" min="0" max="100000" step="1">
+        </label>
+        <label>Core speed vs this machine <span class="unit" title="Applies to a machine you describe, and to the servers compared below">?</span>
+          <select id="c-speed">
+            <option value="1">Same as this machine</option>
+            <option value="1.5">1.5&times; &mdash; a typical cloud server</option>
+            <option value="2">2&times; &mdash; a modern dedicated server</option>
+            <option value="0.75">0.75&times; &mdash; a slow shared VPS</option>
+          </select>
+        </label>
+      </fieldset>
+
+      <fieldset>
+        <legend>Overrides <span class="hint">leave at 0 to decide automatically</span></legend>
+        <label>Conversions at once
+          <input type="number" id="c-parallel" min="0" max="64" step="1" value="0">
+        </label>
+        <label>Pages each renders at once
+          <input type="number" id="c-perjob" min="0" max="64" step="1" value="0">
+        </label>
+      </fieldset>
+    </div>
+
+    <div class="calc-result" id="calc-result" aria-live="polite">
+      <p class="muted">Working it out&hellip;</p>
+    </div>
+  </div>
+
+  <p class="calc-footnote" id="calc-basis"></p>
+</dialog>
 
 <main class="layout">
 
@@ -35,7 +117,13 @@
       </div>
 
       <div class="local-source" id="local-source">
-        <p class="hint">Converted where it is &mdash; no upload, no copy.</p>
+        <div class="list-head">
+          <p class="hint">Converted where it is &mdash; no upload, no copy.</p>
+          <label class="select-all" id="select-all-wrap" hidden>
+            <input type="checkbox" id="select-all">
+            <span id="select-all-label">Select all</span>
+          </label>
+        </div>
         <div class="local-list" id="local-list"><p class="muted">Looking for backups&hellip;</p></div>
         <label class="path-label" for="local-path">Or paste the full path</label>
         <div class="path-row">
@@ -64,6 +152,19 @@
       <button type="submit" class="primary" id="start-btn" disabled>Start conversion</button>
       <p class="form-error" id="form-error" hidden></p>
     </form>
+  </section>
+
+  <!-- ================= batch queue ================= -->
+  <section class="panel" id="queue-panel" hidden>
+    <div class="panel-head">
+      <h2>Batch</h2>
+      <div class="head-actions">
+        <span id="queue-summary" class="muted"></span>
+        <button type="button" class="ghost" id="queue-cancel">Cancel remaining</button>
+      </div>
+    </div>
+    <p class="hint" id="queue-note"></p>
+    <ol class="queue" id="queue"></ol>
   </section>
 
   <!-- ================= progress ================= -->
@@ -131,5 +232,6 @@
 </footer>
 
 <script src="/static/app.js"></script>
+<script src="/static/calculator.js"></script>
 </body>
 </html>

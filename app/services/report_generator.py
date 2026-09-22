@@ -76,6 +76,8 @@ class ReportData:
     stage_timings: dict = field(default_factory=dict)
     """Seconds spent in each stage of the job."""
     render_timings: dict = field(default_factory=dict)
+    render_spread: dict = field(default_factory=dict)
+    """Distribution of per-page render times: mean alone hides a slow tail."""
     """Average seconds per page in each render phase."""
     quality: dict = field(default_factory=dict)
     """Problems, source issues and self-repairs; see app.services.quality."""
@@ -88,6 +90,8 @@ class ReportData:
     # packaging
     zip_name: str = ""
     zip_bytes: int = 0
+    export_path: str = ""
+    """Where the ZIP was collected, beside every other job's."""
     zip_files: int = 0
 
     @property
@@ -365,6 +369,15 @@ def render_report(data: ReportData) -> str:
             timings_html += (
                 f"<p class='sub'>Average per page while rendering: {_e(phases)} "
                 f"(total {data.render_timings.get('total', 0):.1f}s per page).</p>"
+            )
+        if data.render_spread:
+            s = data.render_spread
+            timings_html += (
+                f"<p class='sub'>Spread across {s.get('pages', 0)} pages: fastest "
+                f"{s.get('fastest', 0):.1f}s, median {s.get('median', 0):.1f}s, "
+                f"90th percentile {s.get('p90', 0):.1f}s, slowest "
+                f"{s.get('slowest', 0):.1f}s. The slowest tenth of pages took "
+                f"{s.get('slowest_tenth_share', 0):.0f}% of the rendering time.</p>"
             )
     else:
         timings_html = '<p class="empty">No step timings were recorded.</p>'

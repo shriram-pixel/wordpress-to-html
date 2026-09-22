@@ -135,3 +135,58 @@ def test_the_server_never_reads_the_system_configuration(tmp_path, monkeypatch):
     assert command[1] == "--no-defaults", "must come before every other option"
     pid_file = next(a for a in command if a.startswith("--pid-file="))
     assert str(tmp_path) in pid_file, "the pid file belongs to the job, not to /run/mysqld"
+
+
+def init_command(monkeypatch, *, windows: bool) -> list[str]:
+    """The command initialise() would run on the given platform."""
+    captured: dict = {}
+
+    class Result:
+        returncode, stdout, stderr = 0, "", ""
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        return Result()
+
+    runtime = MysqlRuntime(server_binary=Path("/usr/sbin/mariadbd"), version="10.11.2",
+                           source="system", flavour="mariadb",
+                           install_db_binary=Path("mariadb-install-db"))
+    server = MysqlServer(runtime=runtime, data_dir=Path("/tmp/job/data"))
+
+    monkeypatch.setattr("app.services.wordpress_runner._IS_WINDOWS", windows)
+    monkeypatch.setattr("app.services.wordpress_runner.subprocess.run", fake_run)
+    # Always False: a data directory that already holds "mysql" makes
+    # initialise() return before it builds anything.
+    monkeypatch.setattr(Path, "is_dir", lambda self: False)
+    monkeypatch.setattr(Path, "mkdir", lambda self, **kw: None)
+    monkeypatch.setattr(Path, "resolve", lambda self: self)
+
+    try:
+        server.initialise()
+    except Exception:
+        pass                       # the data dir check is not what is tested
+    return captured.get("command", [])
+
+
+def test_windows_install_db_is_not_given_posix_only_options(monkeypatch):
+    """mariadb-install-db.exe is a different program from the shell script.
+
+    It rejects --no-defaults and --basedir with "unknown option" and exits
+    non-zero, which fails the job at "could not create the temporary database
+    data directory" -- a message that names neither the flag nor the cause.
+    Adding the flag for Linux broke every conversion on Windows.
+    """
+    command = init_command(monkeypatch, windows=True)
+
+    assert command, "initialise() must build a command"
+    assert "--no-defaults" not in command
+    assert not any(a.startswith("--basedir") for a in command)
+    assert any(a.startswith("--datadir") for a in command)
+
+
+def test_posix_install_db_does_get_them(monkeypatch):
+    """On Linux the shell script needs both, or it reads /etc/mysql/my.cnf."""
+    command = init_command(monkeypatch, windows=False)
+
+    assert "--no-defaults" in command
+    assert any(a.startswith("--basedir") for a in command)

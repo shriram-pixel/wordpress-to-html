@@ -136,12 +136,14 @@ class MysqlServer:
         logger.info("initialising database data directory at %s", self.data_dir)
 
         if self.runtime.flavour == "mariadb" and self.runtime.install_db_binary:
-            command = [
-                str(self.runtime.install_db_binary),
-                *_NO_SYSTEM_DEFAULTS,
-                f"--datadir={self.data_dir}",
-                "--default-user",
-            ]
+            command = [str(self.runtime.install_db_binary)]
+            if not _IS_WINDOWS:
+                # Windows ships mariadb-install-db.exe, a different program
+                # from the POSIX shell script: it takes neither --no-defaults
+                # nor --basedir and exits with "unknown option" on either. It
+                # has no system my.cnf to ignore, so it needs neither.
+                command.extend(_NO_SYSTEM_DEFAULTS)
+            command += [f"--datadir={self.data_dir}", "--default-user"]
             if not _IS_WINDOWS:
                 command.append(f"--basedir={self.runtime.base_dir}")
         elif self.runtime.flavour == "mariadb":

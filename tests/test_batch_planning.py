@@ -122,7 +122,9 @@ def test_an_explicit_parallel_is_obeyed_but_questioned(tmp_path, monkeypatch, ba
     assert "more than this machine's disk supports" in plan.warning
 
 
-@pytest.mark.parametrize("parallel, expected_pages", [(1, 6), (2, 6), (3, 4), (4, 3), (8, 2)])
+# One conversion at a time gets the machine's whole page budget: there is
+# nothing to share it with. Two or more get a slice each.
+@pytest.mark.parametrize("parallel, expected_pages", [(1, 12), (2, 6), (3, 4), (4, 3), (8, 2)])
 def test_each_job_gets_a_share_of_the_page_budget(tmp_path, monkeypatch, backups,
                                                   parallel, expected_pages):
     fake_disk(monkeypatch, 500)
@@ -139,3 +141,50 @@ def test_no_backups_left_to_convert_still_plans(tmp_path, monkeypatch):
     plan = plan_batch(machine(), tmp_path, [])
 
     assert plan.parallel >= 1 and plan.per_job >= 2
+
+
+# --------------------------------------------------------------- scaling ---
+# The render ceiling used to be a flat 12 however big the machine was, so a
+# 64-core server rendered no more pages at once than a 16-core one and the
+# extra cores were bought for nothing.
+
+def test_a_desktop_is_still_held_to_twelve():
+    """The cap exists to keep a PC usable while it works. That still holds."""
+    from app.utils import capacity
+
+    assert capacity._DESKTOP_RENDER_CAP == 12
+    small = plan_for_machine(capacity, cpus=4, memory_gib=16)
+    assert small.render_concurrency <= 12
+
+
+def test_a_big_server_is_allowed_more_than_twelve():
+    from app.utils import capacity
+
+    big = plan_for_machine(capacity, cpus=32, memory_gib=128)
+    assert big.render_concurrency > 12, "a 32-core server must use more than a desktop"
+    assert big.render_concurrency <= capacity._RENDER_CEILING
+
+
+def test_the_ceiling_still_bounds_an_enormous_machine():
+    from app.utils import capacity
+
+    huge = plan_for_machine(capacity, cpus=256, memory_gib=1024)
+    assert huge.render_concurrency == capacity._RENDER_CEILING
+
+
+def plan_for_machine(capacity, cpus: int, memory_gib: int):
+    import unittest.mock as mock
+
+    with mock.patch.object(capacity, "cpu_count", lambda: cpus), \
+         mock.patch.object(capacity, "memory_bytes",
+                           lambda: (memory_gib * _GIB, memory_gib * _GIB)):
+        return capacity.measure()
+
+
+def test_pages_per_job_can_be_overridden(tmp_path, monkeypatch, backups):
+    """--pages: the operator has measured something the formula cannot see."""
+    fake_disk(monkeypatch, 500)
+    plan = plan_batch(machine(cpus=16), tmp_path, backups(3), requested=4, pages=8)
+
+    assert plan.per_job == 8, "an explicit page count wins over the share"
+    assert plan.parallel == 4

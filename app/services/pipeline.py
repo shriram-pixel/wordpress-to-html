@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -740,6 +741,7 @@ class ConversionPipeline:
             "visual": report.visual,
             "stage_timings": report.stage_timings,
             "render_timings": report.render_timings,
+            "render_spread": report.render_spread,
             "problems": len((report.quality or {}).get("problems", [])),
             "source_issues": len((report.quality or {}).get("source_issues", [])),
             "repaired": (report.quality or {}).get("repaired_count", 0),
@@ -1395,6 +1397,7 @@ class ConversionPipeline:
             f"{context.report.urls_failed} failed",
         )
         breakdown = _average_timings(context.render_timings)
+        context.report.render_spread = _timing_spread(context.render_timings)
         if breakdown:
             context.report.render_timings = breakdown
             self._log(
@@ -1426,8 +1429,14 @@ class ConversionPipeline:
         body = response.content
         # Sitemaps and feeds carry absolute URLs to the render server; point
         # them at the deployed site's own paths instead.
+        #
+        # Every spelling, not just the canonical one. A Yoast sitemap links its
+        # XSL stylesheet protocol-relatively -- href="//127.0.0.1:58770/..." --
+        # which contains no "http:" and so survived a replacement of the base
+        # URL alone, shipping the render server's address to the live site.
         if context.base_url:
-            body = body.replace(context.base_url.encode(), b"")
+            for variant in sorted(host_variants(context.base_url), key=len, reverse=True):
+                body = body.replace(variant.encode(), b"")
 
         atomic_write_bytes(safe_join(self.workspace.output, output_path), body)
         self.store.update_url(
@@ -1950,7 +1959,9 @@ class ConversionPipeline:
         reporting.write_report(context.report, self.workspace.report)
 
         name = self.options.zip_name or _zip_name_for(
-            self.job.filename, flat=not self.options.preserve_url_structure
+            self.job.filename,
+            flat=not self.options.preserve_url_structure,
+            when=self.job.started_at,
         )
         # Never replace an existing ZIP: a previous run's result is the user's.
         zip_path = unique_path(self.workspace.root / name)
@@ -1971,7 +1982,36 @@ class ConversionPipeline:
             f"packaged {result.files:,} file(s) into {zip_path.name} "
             f"({result.bytes_compressed / 1048576:.1f} MiB)",
         )
+
+        self._publish_to_exports(zip_path)
         return zip_path
+
+    def _publish_to_exports(self, zip_path: Path) -> None:
+        """Put the finished ZIP where every job's ZIP goes.
+
+        Ten conversions otherwise leave ten ZIPs in ten job folders named after
+        job ids, which is a poor place to look for a deliverable. A hard link
+        where the filesystem allows one, so collecting them costs no disk; a
+        copy across volumes, where it necessarily does.
+        """
+        exports = self.settings.exports
+        try:
+            exports.mkdir(parents=True, exist_ok=True)
+            published = unique_path(exports / zip_path.name)
+            try:
+                os.link(zip_path, published)
+                how = "linked"
+            except OSError:
+                # Different volume, or a filesystem without hard links.
+                shutil.copy2(zip_path, published)
+                how = "copied"
+            self.context.report.export_path = str(published)
+            self.store.merge_summary(self.job.id, {"export_path": str(published)})
+            self._log("ZIP", f"{how} to {published}")
+        except OSError as exc:
+            # The ZIP is already safe in the job workspace; failing to collect
+            # a second reference to it must not fail the conversion.
+            self._log("ZIP", f"could not copy the ZIP to {exports}: {exc}", "WARN")
 
 
 # ---------------------------------------------------------------------------
@@ -2021,6 +2061,34 @@ def _average_timings(entries: list[dict]) -> dict[str, float]:
     average = {name: round(total / len(entries), 2) for name, total in totals.items()}
     average["total"] = round(sum(average.values()), 2)
     return average
+
+
+def _timing_spread(entries: list[dict]) -> dict[str, float]:
+    """How page times are distributed, not just their mean.
+
+    A mean of ten seconds can be five hundred steady pages or four hundred
+    fast ones and a hundred that time out, and the two want opposite fixes:
+    the first is the site, the second is a handful of pages. The mean cannot
+    tell them apart, so record the shape as well.
+    """
+    totals = sorted(sum(float(v) for v in entry.values()) for entry in entries)
+    if not totals:
+        return {}
+
+    def at(fraction: float) -> float:
+        return round(totals[min(len(totals) - 1, int(len(totals) * fraction))], 2)
+
+    slowest = totals[int(len(totals) * 0.9):]
+    return {
+        "pages": len(totals),
+        "fastest": round(totals[0], 2),
+        "median": at(0.5),
+        "p90": at(0.9),
+        "slowest": round(totals[-1], 2),
+        # What finishing the slow tail early would actually be worth, which is
+        # the number that decides whether chasing it is worth anyone's time.
+        "slowest_tenth_share": round(100 * sum(slowest) / sum(totals), 1) if totals else 0.0,
+    }
 
 
 def _normalise_error(text: str) -> str:
@@ -2132,7 +2200,15 @@ def _site_url_replacements(plain: dict[str, str]) -> dict[str, str]:
     return dict(sorted(replacements.items(), key=lambda kv: len(kv[0]), reverse=True))
 
 
-def _zip_name_for(filename: str, *, flat: bool = False) -> str:
-    """ZIP name, saying which page layout it holds so the two are never confused."""
+def _zip_name_for(filename: str, *, flat: bool = False, when: float | None = None) -> str:
+    """ZIP name: which backup, which page layout, and which run produced it.
+
+    The run's date and time are in the name because the same backup is
+    converted more than once -- after a fix, with different options, to compare
+    a change -- and two runs of the same site must not produce two files called
+    the same thing. Sorting the export folder by name then also sorts it by
+    when each ZIP was made.
+    """
     stem = Path(filename).stem or "website"
-    return f"{stem}-static{'-flat' if flat else ''}.zip"
+    stamp = time.strftime("%Y%m%d-%H%M", time.localtime(when if when else time.time()))
+    return f"{stem}-static{'-flat' if flat else ''}-{stamp}.zip"

@@ -127,7 +127,11 @@ def scan_leftovers(
 
     for path in output_dir.rglob("*"):
         suffix = path.suffix.lower()
-        if suffix not in {".html", ".htm", ".css", ".js"} or not path.is_file():
+        # .xml and .txt are here because sitemaps, feeds and robots.txt are
+        # copied rather than rendered, and took a different route through the
+        # rewriting. A Yoast sitemap shipped the render server's address and
+        # nothing reported it, because the scan only looked at pages.
+        if suffix not in {".html", ".htm", ".css", ".js", ".xml", ".txt"} or not path.is_file():
             continue
         relative = path.relative_to(output_dir).as_posix()
         try:

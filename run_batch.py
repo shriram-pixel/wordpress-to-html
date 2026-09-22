@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from app.config import get_settings  # noqa: E402
+from app.services import estimator  # noqa: E402
 from app.utils.capacity import Capacity, measure  # noqa: E402
 from app.utils.filesystem import human_bytes  # noqa: E402
 
@@ -37,17 +38,11 @@ _print_lock = threading.Lock()
 
 _GIB = 1024 ** 3
 
-#: A conversion's working set is the extracted WordPress, the generated site
-#: and the ZIP: about three times the backup it started from.
-_DISK_PER_BACKUP = 3
-
-#: Never plan to use the last of the disk. Filling it mid-render loses every
-#: hour a job has spent, and takes its three neighbours down with it.
-_DISK_RESERVE = 10 * _GIB
-
-#: One conversion runs its own database, PHP pool and browser. 3.6 GB is the
-#: measured working set; 8 GB leaves room for a page-builder site's peaks.
-_MEMORY_PER_JOB = 8 * _GIB
+# The sizing rules live with the estimator, so the planner in the web
+# interface answers with the numbers this script will actually use.
+_DISK_PER_BACKUP = estimator.DISK_PER_BACKUP
+_DISK_RESERVE = estimator.DISK_RESERVE
+_MEMORY_PER_JOB = estimator.MEMORY_PER_JOB
 
 
 def say(message: str) -> None:
@@ -135,7 +130,7 @@ def _backup_size(path: Path) -> int:
 
 
 def plan_batch(machine: Capacity, jobs_dir: Path, backups: list[Path],
-               requested: int = 0) -> Plan:
+               requested: int = 0, pages: int = 0) -> Plan:
     """Decide how many conversions run at once, from cores, memory and disk.
 
     Disk is the constraint that is easy to forget and expensive to get wrong.
@@ -145,37 +140,18 @@ def plan_batch(machine: Capacity, jobs_dir: Path, backups: list[Path],
     lose. Sizing the batch against the largest backup, once, avoids that.
     """
     largest = max((_backup_size(b) for b in backups), default=0)
-
-    by_cpu = max(1, machine.cpus // 4)
-
-    # Free memory on a busy machine, but never less than half of it: a server
-    # that is momentarily holding cache should not halve an overnight batch.
-    budget = max(machine.available_memory, machine.total_memory * 0.5) - 4 * _GIB
-    by_memory = max(1, int(budget // _MEMORY_PER_JOB)) if machine.total_memory else by_cpu
-
     try:
         free = shutil.disk_usage(jobs_dir).free
     except OSError:
         free = 0
-    if largest and free:
-        by_disk = int((free - _DISK_RESERVE) // (largest * _DISK_PER_BACKUP))
-    else:
-        by_disk = by_cpu
 
-    parallel = requested or max(1, min(by_cpu, by_memory, max(by_disk, 1), 8))
+    parallel, per_job, limits = estimator.size_batch(
+        machine, free, largest, requested, pages
+    )
 
-    # Each conversion measures the whole machine when it starts, so without a
-    # share every job in a batch claims the machine's full page budget: four
-    # jobs each rendering twelve pages is forty-eight browsers on one box, and
-    # every site ends up slower. Give each job a slice of the cores and of the
-    # page budget, and never fewer than two pages.
-    per_job = max(2, min(6,
-                         max(1, machine.render_concurrency // parallel),
-                         max(1, machine.cpus // parallel)))
-
-    return Plan(parallel=parallel, per_job=per_job, by_cpu=by_cpu, by_memory=by_memory,
-                by_disk=by_disk, free_disk=free, largest_backup=largest,
-                requested=bool(requested))
+    return Plan(parallel=parallel, per_job=per_job, by_cpu=limits["cpu"],
+                by_memory=limits["memory"], by_disk=limits["disk"],
+                free_disk=free, largest_backup=largest, requested=bool(requested))
 
 
 def find_backups(source: Path) -> list[Path]:
@@ -271,6 +247,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs-dir", type=Path, help="job workspaces (default: from .env)")
     parser.add_argument("--parallel", type=int, default=0,
                         help="conversions at once. Default: measured from this machine")
+    parser.add_argument("--pages", type=int, default=0, metavar="N",
+                        help="pages each conversion renders at once. Default: this "
+                             "machine's page budget divided between the conversions")
     parser.add_argument("--retry", action="store_true",
                         help="convert sites that already have a ZIP again")
     parser.add_argument("--flat", action="store_true", help="one file per page (about.html)")
@@ -303,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
             pending.append(backup)
 
     machine = measure()
-    plan = plan_batch(machine, jobs_dir, pending, args.parallel)
+    plan = plan_batch(machine, jobs_dir, pending, args.parallel, args.pages)
 
     extra: list[str] = ["-c", str(plan.per_job)]
     if args.flat:

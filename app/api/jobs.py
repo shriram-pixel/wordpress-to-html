@@ -9,9 +9,11 @@ from pathlib import Path
 
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from app.config import ConversionOptions
 from app.models.job import JobStatus, UrlState
+from app.services import estimator
 from app.utils.filesystem import JobWorkspace, ensure_free_space, sanitise_upload_name
 from app.utils.security import safe_join
 
@@ -33,6 +35,20 @@ def _manager(request: Request):
 
 def _settings(request: Request):
     return request.app.state.settings
+
+
+def _share_the_machine(request: Request, options: ConversionOptions) -> ConversionOptions:
+    """Give a job its slice of the page budget when several run at once.
+
+    Every conversion measures the whole machine when it starts, so without a
+    share four jobs each claim all of it: four browsers' worth of pages on one
+    box, and every site slower than if they had queued. An explicit setting
+    from the caller always wins.
+    """
+    per_job = getattr(request.app.state, "pages_per_job", 0)
+    if per_job and not options.render_concurrency:
+        return options.model_copy(update={"render_concurrency": per_job})
+    return options
 
 
 @router.get("/health")
@@ -62,6 +78,158 @@ async def option_defaults() -> dict:
     return ConversionOptions().model_dump(mode="json")
 
 
+class EstimateRequest(BaseModel):
+    """A machine and a workload to time. Every field has a default, so the
+    interface can ask for "this machine, ten sites like the last one"."""
+
+    model_config = {"extra": "forbid"}
+
+    cpus: int | None = Field(default=None, ge=1, le=512)
+    memory_gb: float | None = Field(default=None, gt=0, le=4096)
+    free_disk_gb: float | None = Field(default=None, ge=0, le=1_000_000)
+
+    sites: int = Field(default=10, ge=1, le=1000)
+    pages_per_site: int = Field(default=622, ge=1, le=100_000)
+    backup_gb: float = Field(default=2.9, gt=0, le=500)
+
+    cpu_speed: float = Field(default=1.0, gt=0, le=20)
+    seconds_per_page: float = Field(default=estimator.SECONDS_PER_PAGE, gt=0, le=600)
+    fixed_minutes: float = Field(default=estimator.FIXED_MINUTES, ge=0, le=6000)
+
+    parallel: int = Field(default=0, ge=0, le=64)
+    pages_at_once: int = Field(default=0, ge=0, le=64)
+    screenshots: bool = True
+
+
+@router.get("/estimate/machine")
+async def estimate_machine(request: Request) -> dict:
+    """This machine as the planner sees it, plus the measured baseline."""
+    from starlette.concurrency import run_in_threadpool
+
+    settings = _settings(request)
+    machine = await run_in_threadpool(estimator.Machine.here, settings.jobs_dir)
+    capacity = machine.capacity()
+    return {
+        "machine": {
+            "cpus": machine.cpus,
+            "memory_gb": machine.memory_gb,
+            "free_disk_gb": machine.free_disk_gb,
+            "measured": True,
+        },
+        "capacity": {
+            "render_concurrency": capacity.render_concurrency,
+            "php_workers": capacity.php_workers,
+            "html_workers": capacity.html_workers,
+        },
+        "baseline": {
+            "reference": estimator.REFERENCE,
+            "seconds_per_page": estimator.SECONDS_PER_PAGE,
+            "fixed_minutes": estimator.FIXED_MINUTES,
+            "pages": 622,
+            "backup_gb": 2.9,
+            "measured_minutes": 107,
+        },
+    }
+
+
+class ProbeRequest(BaseModel):
+    """A backup to read, by path."""
+
+    model_config = {"extra": "forbid"}
+    path: str = Field(min_length=1, max_length=4096)
+
+
+@router.post("/estimate/pages")
+async def estimate_pages(request: Request, body: ProbeRequest) -> dict:
+    """How many pages a backup holds, read from the archive in place.
+
+    The page count is the one input someone planning a batch cannot know:
+    they have a backup file, not a site. Extracting a 3 GB archive to find
+    out costs minutes and gigabytes, so this steps through the archive's
+    headers and reads only its database.
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    from app.services.backup_probe import probe
+
+    settings = _settings(request)
+    if not settings.local_files_allowed:
+        raise HTTPException(status_code=403, detail="reading local files is disabled")
+
+    archive = Path(body.path.strip().strip('"')).expanduser()
+    if not archive.is_absolute():
+        raise HTTPException(status_code=422, detail="give the full path to the backup")
+    if archive.suffix.lower() != ".wpress":
+        raise HTTPException(status_code=422, detail="only .wpress backups can be read")
+    try:
+        if not archive.is_file():
+            raise HTTPException(status_code=404, detail=f"no such file: {archive}")
+    except OSError as exc:
+        raise HTTPException(status_code=404, detail=f"no such file: {archive}") from exc
+
+    facts = await run_in_threadpool(probe, archive)
+    return {
+        "name": archive.name,
+        "pages": facts.pages,
+        "size_gb": round(facts.size_bytes / (1024 ** 3), 2),
+        "site_url": facts.site_url,
+        "wordpress_version": facts.wordpress_version,
+        "theme": facts.theme,
+        "plugins": facts.plugins,
+        "by_type": dict(list(facts.by_type.items())[:8]),
+        "complete": facts.complete,
+        "note": facts.note,
+    }
+
+
+@router.post("/estimate")
+async def estimate_batch(request: Request, body: EstimateRequest) -> dict:
+    """Time a batch, on this machine or on one being considered."""
+    from starlette.concurrency import run_in_threadpool
+
+    settings = _settings(request)
+    here = await run_in_threadpool(estimator.Machine.here, settings.jobs_dir)
+
+    # Anything the caller left out describes this machine, so the form opens
+    # with real numbers and only what the user changes becomes hypothetical.
+    machine = estimator.Machine(
+        cpus=body.cpus or here.cpus,
+        memory_gb=body.memory_gb or here.memory_gb,
+        free_disk_gb=here.free_disk_gb if body.free_disk_gb is None else body.free_disk_gb,
+        measured=(body.cpus is None and body.memory_gb is None
+                  and body.free_disk_gb is None),
+    )
+    work = estimator.Workload(
+        sites=body.sites,
+        pages_per_site=body.pages_per_site,
+        backup_gb=body.backup_gb,
+        # A core-speed multiplier describes a machine other than this one, so
+        # it cannot apply while this one is still being described: the headline
+        # would then disagree with the "this machine" row of the comparison
+        # directly beneath it, for the same machine.
+        cpu_speed=1.0 if machine.measured else body.cpu_speed,
+        seconds_per_page=body.seconds_per_page,
+        fixed_minutes=body.fixed_minutes,
+        parallel=body.parallel,
+        pages_at_once=body.pages_at_once,
+        screenshots=body.screenshots,
+    )
+    result = estimator.estimate(machine, work)
+    return {
+        "machine": {"cpus": machine.cpus, "memory_gb": machine.memory_gb,
+                    "free_disk_gb": machine.free_disk_gb, "measured": machine.measured},
+        "estimate": result.as_dict(),
+        # The same workload on machines of other sizes. Pure arithmetic, so it
+        # costs nothing to send, and it answers the question a single estimate
+        # cannot: whether a bigger server is worth buying.
+        # The compared servers do use the chosen speed: they are hypothetical,
+        # which is the whole point of the setting.
+        "comparison": estimator.compare(
+            estimator.Workload(**{**work.__dict__, "cpu_speed": body.cpu_speed}), here
+        ),
+    }
+
+
 @router.post("/jobs", status_code=201)
 async def create_job(
     request: Request,
@@ -77,7 +245,7 @@ async def create_job(
         parsed = json.loads(options) if options else {}
         if not isinstance(parsed, dict):
             raise ValueError("options must be a JSON object")
-        conversion_options = ConversionOptions(**parsed)
+        conversion_options = _share_the_machine(request, ConversionOptions(**parsed))
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"invalid options: {exc}") from exc
 
@@ -246,7 +414,7 @@ async def create_local_job(request: Request) -> dict:
         options_data = body.get("options") or {}
         if not isinstance(options_data, dict):
             raise ValueError("options must be a JSON object")
-        conversion_options = ConversionOptions(**options_data)
+        conversion_options = _share_the_machine(request, ConversionOptions(**options_data))
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=422, detail=f"invalid options: {exc}") from exc
 

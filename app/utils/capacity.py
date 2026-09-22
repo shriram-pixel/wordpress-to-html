@@ -120,10 +120,40 @@ def _clamp(value: float, low: int, high: int) -> int:
     return int(max(low, min(high, value)))
 
 
-def measure(*, max_render: int = 12) -> Capacity:
-    """Measure the machine and derive a worker count for each stage."""
-    cpus = cpu_count()
+#: Never render more pages at once than this, whatever the machine. A ceiling
+#: exists because each page is a Chromium tab holding a full DOM, and because
+#: beyond roughly one page per core the pages only take turns.
+_RENDER_CEILING = 64
+
+#: The most a machine small enough to be someone's desktop will use. Twelve
+#: pages is about 7 GB of Chromium, which is as much as a PC being worked on
+#: can give up. A server with more cores than this is not a desktop, and
+#: holding it to twelve wastes most of it: a 64-core box would render no more
+#: pages at once than a 16-core one.
+_DESKTOP_RENDER_CAP = 12
+
+
+def measure(*, max_render: int = 0) -> Capacity:
+    """Measure *this* machine and derive a worker count for each stage.
+
+    ``max_render`` overrides the ceiling; 0 derives it from the machine.
+    """
     total, available = memory_bytes()
+    return derive(cpu_count(), total, available, max_render=max_render)
+
+
+def derive(cpus: int, total: int, available: int = 0, *, max_render: int = 0) -> Capacity:
+    """The same reasoning, for a machine that is described rather than measured.
+
+    The planner in the interface answers "what would a 32-core server do?", and
+    it must answer with the numbers a real run would use -- so it asks this,
+    the function a real run asks, rather than a second copy of the rules that
+    would quietly drift away from them.
+    """
+    cpus = max(1, cpus)
+    available = available or total
+    if not max_render:
+        max_render = min(_RENDER_CEILING, max(_DESKTOP_RENDER_CAP, cpus))
 
     # Rendering: whichever of cores and memory runs out first. Chromium pages
     # overlap network waits, so slightly more pages than cores is still a win.

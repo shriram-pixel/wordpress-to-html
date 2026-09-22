@@ -58,6 +58,11 @@ class Settings(BaseSettings):
     runtime_dir: Path = PROJECT_ROOT / "runtime"
     database_path: Path = PROJECT_ROOT / "jobs" / "jobs.sqlite3"
 
+    export_dir: Path | None = None
+    """Where finished ZIPs are collected, so ten conversions do not leave ten
+    ZIPs in ten job folders. Empty means ``<jobs_dir>/exports``. The copy is a
+    hard link where the filesystem allows one, so it costs no extra disk."""
+
     max_upload_bytes: int = 20 * 1024 * 1024 * 1024   # 20 GiB
 
     backup_dirs: str = ""
@@ -123,7 +128,8 @@ class Settings(BaseSettings):
     # -- feature defaults ---------------------------------------------------
     external_policy: ExternalResourcePolicy = ExternalResourcePolicy.PRESERVE
 
-    @field_validator("jobs_dir", "runtime_dir", "database_path", mode="before")
+    @field_validator("jobs_dir", "runtime_dir", "database_path", "export_dir",
+                     mode="before")
     @classmethod
     def _expand(cls, value):
         if value is None:
@@ -137,10 +143,18 @@ class Settings(BaseSettings):
         # command line onto two separate job lists that cannot see each other.
         if "database_path" not in self.model_fields_set:
             self.database_path = self.jobs_dir / "jobs.sqlite3"
+        if self.export_dir is None:
+            self.export_dir = self.jobs_dir / "exports"
         return self
+
+    @property
+    def exports(self) -> Path:
+        """Where finished ZIPs are collected. Always a path, never None."""
+        return self.export_dir or (self.jobs_dir / "exports")
 
     def ensure_directories(self) -> None:
         self.jobs_dir.mkdir(parents=True, exist_ok=True)
+        self.exports.mkdir(parents=True, exist_ok=True)
         self.runtime_dir.mkdir(parents=True, exist_ok=True)
         self.database_path.parent.mkdir(parents=True, exist_ok=True)
 
