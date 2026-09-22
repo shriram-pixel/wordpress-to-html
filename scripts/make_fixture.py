@@ -37,6 +37,14 @@ from app.services.wpress_extractor import WpressWriter  # noqa: E402
 
 logger = logging.getLogger("make_fixture")
 
+#: Pinned, not "latest". A test fixture exists to hold the pipeline still while
+#: it is checked; if it tracked WordPress releases, a green suite would go red
+#: on a day nobody touched this code, and the fixture committed here would stop
+#: matching the one CI builds -- which is exactly what happened: 7.1 in the
+#: repository against 7.1.1 downloaded on the runner. Raise it deliberately,
+#: and rebuild the committed fixture in the same commit.
+FIXTURE_WORDPRESS_VERSION = "7.1"
+
 ORIGINAL_SITE_URL = "https://northwind-studio.example"
 """A domain that does not resolve, on purpose: if any stage of the pipeline
 fails to rewrite a URL, the resulting broken link is obvious rather than
@@ -181,7 +189,7 @@ def build_fixture(output: Path, keep_workspace: bool = False) -> Path:
     logger.info("building in %s", workspace)
 
     try:
-        core = provision_wordpress_core(None, cache)
+        core = provision_wordpress_core(FIXTURE_WORDPRESS_VERSION, cache)
         site_root = workspace / "site"
         shutil.copytree(core, site_root)
         logger.info("copied WordPress core")

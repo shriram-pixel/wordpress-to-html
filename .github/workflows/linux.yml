@@ -104,6 +104,22 @@ jobs:
           cp -r /srv/wpsc-jobs/*/logs /tmp/diag 2>/dev/null || true
           cp /srv/wpsc-jobs/*/mysql-error.log /tmp/diag 2>/dev/null || true
           cp /srv/wpsc-jobs/*/php-server-*.log /tmp/diag 2>/dev/null || true
+          # The integration suite works in /tmp, not /srv, and its PHP and
+          # database logs are the only place a page that returns 200 with an
+          # empty body explains itself.
+          for dir in /tmp/wpsc-test-* /tmp/wpsc-fixture-*; do
+            [ -d "$dir" ] || continue
+            name=$(basename "$dir")
+            mkdir -p "/tmp/diag/$name"
+            cp "$dir"/*.log "/tmp/diag/$name/" 2>/dev/null || true
+            cp "$dir"/mysql-error.log "/tmp/diag/$name/" 2>/dev/null || true
+            cp -r "$dir"/logs "/tmp/diag/$name/" 2>/dev/null || true
+            # What the restore decided about the theme and the plugins.
+            ls -la "$dir" > "/tmp/diag/$name/listing.txt" 2>/dev/null || true
+          done
+          # And what the front page actually returned, if anything is serving.
+          php --version > /tmp/diag/php-version.txt 2>&1 || true
+          php -i 2>/dev/null | grep -iE "display_errors|error_reporting|opcache.enable"             > /tmp/diag/php-settings.txt || true
           cp .env /tmp/diag/env.txt 2>/dev/null || true
           .venv/bin/python scripts/doctor.py --json > /tmp/diag/doctor.json 2>&1 || true
           fc-list | wc -l > /tmp/diag/font-count.txt 2>/dev/null || true
