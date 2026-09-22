@@ -41,6 +41,7 @@ from app.config import ConversionOptions
 from urllib.parse import urlsplit
 
 from app.services.request_policy import RequestAction, classify_request
+from app.utils.capacity import memory_bytes
 from app.utils.urls import is_local_origin
 
 logger = logging.getLogger(__name__)
@@ -198,6 +199,34 @@ def _safe_post_data(request) -> str | None:
         return None
 
 
+#: Never cache more than this, however large the machine. Beyond a gigabyte the
+#: cache is holding assets no page will ask for again, and that memory is worth
+#: more to Chromium, which needs about 600 MB per page it renders.
+_ASSET_CACHE_CEILING = 1024 * 1024 * 1024
+
+#: The previous fixed size. Kept as the floor so a small machine behaves
+#: exactly as it did before.
+_ASSET_CACHE_FLOOR = 192 * 1024 * 1024
+
+
+def default_asset_cache_bytes() -> int:
+    """How much of the restored site to hold in memory while rendering.
+
+    A fixed 192 MB was right for a laptop and wrong for a server: one measured
+    site has 324 MB of assets, so the cache filled and the rest was re-read
+    from disk on every one of 622 pages. Two per cent of installed memory
+    scales that without competing with the browser -- 192 MB on a 16 GB
+    machine, which is what it was, and a gigabyte on anything from 50 GB up.
+
+    Falls back to the floor when memory cannot be read, which is what happens
+    on a platform whose probe fails rather than lies.
+    """
+    total, _available = memory_bytes()
+    if not total:
+        return _ASSET_CACHE_FLOOR
+    return int(max(_ASSET_CACHE_FLOOR, min(_ASSET_CACHE_CEILING, total * 0.02)))
+
+
 class _DiskFiles:
     """Static files of the restored install, read from disk for the browser.
 
@@ -209,7 +238,9 @@ class _DiskFiles:
 
     _NEVER = (".php", ".phtml", ".htaccess", ".ini", ".log", ".sql")
 
-    def __init__(self, root: Path, *, max_cached_bytes: int = 192 * 1024 * 1024) -> None:
+    def __init__(self, root: Path, *, max_cached_bytes: int | None = None) -> None:
+        if max_cached_bytes is None:
+            max_cached_bytes = default_asset_cache_bytes()
         self.root = root
         self.max_cached_bytes = max_cached_bytes
         self._cache: dict[str, tuple[bytes, str]] = {}

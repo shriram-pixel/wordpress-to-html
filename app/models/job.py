@@ -52,20 +52,42 @@ class JobStatus(StrEnum):
 
 
 #: Weight of each stage in the overall progress bar. Rendering dominates.
+#: What share of a job each stage takes, used for the progress bar and the
+#: estimate of time remaining. Measured, not guessed:
+#:
+#:                     weighted   aungmetals   tinitamfg
+#:     extracting          0.05      4.0%          --
+#:     restoring           0.15     22.7%         4.7%
+#:     starting WP         0.04      3.8%          --
+#:     discovering         0.01      0.2%         0.7%
+#:     rendering           0.55     53.9%        61.4%
+#:     generating HTML     0.08      8.0%         8.3%
+#:     collecting assets   0.03      2.2%         4.4%
+#:     validating          0.07      3.7%        17.3%
+#:     zipping             0.02      1.4%         3.2%
+#:
+#: The two sites disagree -- restoring is a 1.9 GB import on one and 115 MB on
+#: the other -- so these sit between them rather than matching either. What
+#: matters is that they are the right order of magnitude: the old values had
+#: restoring at 0.07 when it really takes a fifth of a job, and collecting
+#: assets at 0.20 when hard links and disk serving cut it to a fiftieth. The
+#: bar therefore crawled through the restore and jumped at the end, and the
+#: estimate of time remaining, which extrapolates from progress, read high for
+#: most of the run.
 STAGE_WEIGHTS: dict[JobStatus, float] = {
     JobStatus.QUEUED: 0.0,
-    JobStatus.EXTRACTING: 0.08,
-    JobStatus.RESTORING: 0.07,
-    JobStatus.STARTING_WORDPRESS: 0.05,
-    JobStatus.DISCOVERING_URLS: 0.05,
-    JobStatus.RENDERING: 0.38,
+    JobStatus.EXTRACTING: 0.05,
+    JobStatus.RESTORING: 0.15,
+    JobStatus.STARTING_WORDPRESS: 0.04,
+    JobStatus.DISCOVERING_URLS: 0.01,
+    JobStatus.RENDERING: 0.55,
     # Generation runs before downloading: processing the rendered DOM is what
     # discovers which assets exist, so the order here matches execution and
     # keeps the progress bar monotonic.
-    JobStatus.GENERATING_HTML: 0.05,
-    JobStatus.DOWNLOADING_ASSETS: 0.20,
-    JobStatus.VALIDATING: 0.08,
-    JobStatus.ZIPPING: 0.04,
+    JobStatus.GENERATING_HTML: 0.08,
+    JobStatus.DOWNLOADING_ASSETS: 0.03,
+    JobStatus.VALIDATING: 0.07,
+    JobStatus.ZIPPING: 0.02,
 }
 
 
