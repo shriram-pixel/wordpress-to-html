@@ -75,6 +75,36 @@ class AssetStats:
         self.by_kind[kind] = self.by_kind.get(kind, 0) + 1
 
 
+#: Extensions whose content is never an HTML document. A request for one of
+#: these that comes back as HTML is a page, not the asset.
+_NEVER_HTML = (
+    ".css", ".js", ".mjs", ".json", ".map",
+    ".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg", ".ico", ".bmp",
+    ".woff", ".woff2", ".ttf", ".otf", ".eot",
+    ".mp4", ".webm", ".mp3", ".wav", ".ogg", ".zip", ".pdf",
+)
+
+
+def _is_html_response(url: str, content_type: str) -> bool:
+    """Whether the server answered an asset request with a web page.
+
+    WordPress serves its "not found" page for any path it does not recognise,
+    and the built-in PHP server returns it with status 200 -- so a status check
+    alone accepts it. Elementor writes each page's CSS to uploads on demand,
+    and any of those files the backup does not contain is requested, missed,
+    and answered with 286 KB of HTML.
+
+    Saved as ``post-1234.css`` that silently removes a page's entire layout:
+    the browser fetches a stylesheet, gets a document, and applies nothing. It
+    is worse than a missing file, which at least gets reported and repaired.
+    """
+    mime = (content_type or "").split(";", 1)[0].strip().lower()
+    if mime not in {"text/html", "application/xhtml+xml"}:
+        return False
+    path = urlsplit(url).path.lower()
+    return path.endswith(_NEVER_HTML)
+
+
 def kind_for(url: str, content_type: str = "") -> str:
     """Classify an asset for the report's breakdown."""
     import posixpath
@@ -475,6 +505,14 @@ class AssetManager:
 
             content_type = response.headers.get("content-type", "")
             record.content_type = record.content_type or content_type
+
+            if _is_html_response(url, content_type):
+                record.error = (
+                    "the server returned an HTML page instead of the file "
+                    "(it is missing from the backup)"
+                )
+                record.retryable = False
+                return False
 
             # Reject an oversized asset from its header, before any of it is
             # transferred, when the server tells us the size up front.
