@@ -97,6 +97,18 @@ def restore_demo_site(workspace: Path | None = None, *, quiet: bool = True) -> R
     )
     restorer.write_control_plugin(wp_root)
     restorer.replace_urls_in_database(mysql, database, {original: base_url})
+
+    # The same repair the pipeline performs, and for the same reason: an
+    # All-in-One WP Migration export omits stylesheet, template and
+    # active_plugins, so a restore that skips this step has no theme and no
+    # plugins -- a site that answers 200 with an empty body.
+    #
+    # The harness did skip it, and the integration suite passed anyway,
+    # because the fixture committed to the repository predates the change that
+    # made make_fixture.py omit those options as faithfully as AI1WM does. A
+    # freshly built fixture exposed it immediately. Restoring here the way the
+    # pipeline restores is what keeps the suite honest.
+    restorer.repair_activation_state(mysql, database, prefix, wp_root, recorded=layout)
     restorer.configure_for_static_export(mysql, database, prefix, base_url)
 
     php = PhpServer(runtime=runtimes.php, document_root=wp_root, port=port, workers=4)
