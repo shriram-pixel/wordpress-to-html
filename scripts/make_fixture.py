@@ -267,16 +267,17 @@ require_once ABSPATH . 'wp-settings.php';
 
         # --- export ----------------------------------------------------------
         dump_path = workspace / "database.sql"
-        dump_binary = None
-        for candidate in ("mariadb-dump", "mysqldump"):
-            probe = mysql_runtime.server_binary.parent / (
-                candidate + (".exe" if sys.platform == "win32" else "")
-            )
-            if probe.is_file():
-                dump_binary = probe
-                break
+        # Found when the runtime was probed, which looks beside the server and
+        # then in the places a distribution actually puts these tools. Looking
+        # only next to the server found nothing on Ubuntu, where the server is
+        # /usr/sbin/mariadbd and its tools are all in /usr/bin.
+        dump_binary = mysql_runtime.dump_binary
         if dump_binary is None:
-            raise RuntimeError("no mysqldump/mariadb-dump binary found next to the server")
+            raise RuntimeError(
+                "no mariadb-dump/mysqldump found beside "
+                f"{mysql_runtime.server_binary} or on PATH. "
+                "On Debian/Ubuntu: sudo apt install mariadb-client"
+            )
 
         logger.info("dumping the database with %s", dump_binary.name)
         with dump_path.open("wb") as out:

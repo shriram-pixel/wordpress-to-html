@@ -31,7 +31,7 @@ def debian_layout(tmp_path: Path) -> tuple[Path, Path]:
     sbin.mkdir(parents=True)
     bin_.mkdir(parents=True)
     (sbin / "mariadbd").write_text("#!/bin/sh\n")
-    for helper in ("mariadb-install-db", "mariadb", "mariadb-admin"):
+    for helper in ("mariadb-install-db", "mariadb", "mariadb-admin", "mariadb-dump"):
         (bin_ / helper).write_text("#!/bin/sh\n")
     return sbin / "mariadbd", bin_
 
@@ -55,6 +55,10 @@ def test_helpers_are_found_in_the_sibling_bin_directory(tmp_path, monkeypatch):
     assert runtime.install_db_binary == bin_ / "mariadb-install-db"
     assert runtime.client_binary == bin_ / "mariadb"
     assert runtime.admin_binary == bin_ / "mariadb-admin"
+    # Found the same way as the rest. Looked for only beside the server, it
+    # was missing on Ubuntu and the fixture build failed after installing a
+    # whole WordPress -- the last step of a job that had otherwise worked.
+    assert runtime.dump_binary == bin_ / "mariadb-dump"
 
 
 def test_helpers_beside_the_server_win_over_the_system_ones(tmp_path, monkeypatch):

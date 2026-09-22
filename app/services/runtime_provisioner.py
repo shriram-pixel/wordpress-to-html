@@ -104,6 +104,10 @@ class MysqlRuntime:
     provides one. Absent on MySQL for Windows, which uses ``--initialize``."""
     client_binary: Path | None = None
     admin_binary: Path | None = None
+    dump_binary: Path | None = None
+    """``mariadb-dump`` / ``mysqldump``. Only the fixture builder needs it, but
+    it is found here so there is one place that knows where a distribution
+    keeps these tools -- /usr/bin, while the server is in /usr/sbin."""
     flavour: str = "mariadb"
     """``mariadb`` or ``mysql``; they differ in how a data directory is made."""
 
@@ -284,6 +288,7 @@ def probe_mysql(server_binary: Path, source: str = "unknown") -> MysqlRuntime | 
             install_db_binary=first("mariadb-install-db", "mysql_install_db"),
             client_binary=first("mariadb", "mysql"),
             admin_binary=first("mariadb-admin", "mysqladmin"),
+            dump_binary=first("mariadb-dump", "mysqldump"),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logger.debug("mysql probe failed for %s: %s", server_binary, exc)
