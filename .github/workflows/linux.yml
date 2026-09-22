@@ -56,6 +56,31 @@ jobs:
           ulimit -n 65535
           .venv/bin/python -m pytest -q -m "not integration"
 
+      # What the database helper on this machine says it accepts, and the
+      # command that produces. Printed before anything uses it, because the
+      # failures here name mariadbd rather than the flag that upset it, and
+      # one line of evidence beats another round trip through CI.
+      - name: What the database helper accepts
+        run: |
+          .venv/bin/python - <<'PY'
+          from pathlib import Path
+          from app.config import get_settings
+          from app.services.runtime_provisioner import find_mysql
+          from app.services.wordpress_runner import _install_db_command, _supported_options
+
+          settings = get_settings()
+          runtime = find_mysql(settings.mysqld_binary, settings.runtime_dir)
+          print("server      :", runtime.server_binary)
+          print("install-db  :", runtime.install_db_binary)
+          print("client      :", runtime.client_binary)
+          print("basedir     :", runtime.base_dir)
+
+          options = _supported_options(str(runtime.install_db_binary))
+          print("advertises  :", " ".join(sorted(options)) or "(nothing -- probe failed)")
+          print("command     :", _install_db_command(
+              Path(runtime.install_db_binary), Path("/tmp/probe/data"), runtime.base_dir))
+          PY
+
       # Not committed (17 MB), so it is built here -- which is itself a good
       # test: it installs a genuine WordPress, so it exercises the MariaDB data
       # directory creation and the PHP server before the integration suite does.
