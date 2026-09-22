@@ -1,0 +1,88 @@
+# Verify the Linux path on real Linux.
+#
+# This project is developed on Windows, and every Linux-specific fix in it was
+# made by reading code rather than running it -- which once fixed Linux and
+# broke Windows with the whole suite passing, because the tests stubbed the
+# binary that rejected the flag. Only a real run settles it.
+#
+# GitHub's runners are Ubuntu 24.04 with Python 3.12, which is exactly the
+# platform docs/LINUX.md recommends, so this exercises the same steps a server
+# would: setup.sh, the dependency check, the fast tests, building a real
+# WordPress fixture, and a full conversion of it.
+
+name: Linux
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:      # so it can be run by hand, any time
+
+jobs:
+  ubuntu:
+    name: Ubuntu 24.04
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: The machine, as section 3.1 of docs/LINUX.md describes
+        run: |
+          lscpu | grep -E "^CPU\(s\)|Thread|Model name" || true
+          free -g
+          df -h .
+          echo "open files: $(ulimit -n)"
+          python3 --version
+
+      # Runs the real script, as root, exactly as a server would. It installs
+      # PHP, MariaDB, Chromium and fonts, relaxes the AppArmor profile that
+      # would otherwise stop a per-job database, and creates the virtualenv as
+      # the invoking user rather than as root.
+      - name: setup.sh
+        run: sudo ./setup.sh
+
+      - name: Dependencies are real (scripts/doctor.py)
+        run: |
+          ulimit -n 65535
+          .venv/bin/python scripts/doctor.py
+
+      - name: Fast tests
+        run: |
+          ulimit -n 65535
+          .venv/bin/python -m pytest -q -m "not integration"
+
+      # Not committed (17 MB), so it is built here -- which is itself a good
+      # test: it installs a genuine WordPress, so it exercises the MariaDB data
+      # directory creation and the PHP server before the integration suite does.
+      - name: Build the demo WordPress fixture
+        run: |
+          ulimit -n 65535
+          .venv/bin/python scripts/make_fixture.py
+
+      - name: Integration suite (a real restore, render and export)
+        run: |
+          ulimit -n 65535
+          .venv/bin/python -m pytest -q -m integration
+
+      # Whatever failed, the logs say why. Job workspaces hold the database
+      # error log and the PHP server logs, which is where a Linux-only failure
+      # explains itself.
+      - name: Collect logs when something fails
+        if: failure()
+        run: |
+          mkdir -p /tmp/diag
+          cp -r /srv/wpsc-jobs/*/logs /tmp/diag 2>/dev/null || true
+          cp /srv/wpsc-jobs/*/mysql-error.log /tmp/diag 2>/dev/null || true
+          cp /srv/wpsc-jobs/*/php-server-*.log /tmp/diag 2>/dev/null || true
+          cp .env /tmp/diag/env.txt 2>/dev/null || true
+          .venv/bin/python scripts/doctor.py --json > /tmp/diag/doctor.json 2>&1 || true
+          fc-list | wc -l > /tmp/diag/font-count.txt 2>/dev/null || true
+
+      - name: Upload the logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-failure-logs
+          path: /tmp/diag
+          retention-days: 7

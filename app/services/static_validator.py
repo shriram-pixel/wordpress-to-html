@@ -57,6 +57,13 @@ class ValidationReport:
     missing_assets: list[BrokenReference] = field(default_factory=list)
     external_links: int = 0
     orphaned_files: list[str] = field(default_factory=list)
+    case_mismatches: list[BrokenReference] = field(default_factory=list)
+    """References whose spelling differs from the file's only in case.
+
+    These resolve on Windows and 404 on Linux, which is where the export will
+    be hosted -- so they are a defect wherever the conversion ran. Reported
+    apart from missing assets because the fix is different: the file is there,
+    the link's spelling is wrong."""
 
     console_errors: list[dict] = field(default_factory=list)
     page_errors: list[dict] = field(default_factory=list)
@@ -73,7 +80,8 @@ class ValidationReport:
 
     @property
     def is_clean(self) -> bool:
-        return not (self.broken_links or self.missing_assets or self.page_errors)
+        return not (self.broken_links or self.missing_assets or self.page_errors
+                    or self.case_mismatches)
 
     def summary(self) -> dict:
         return {
@@ -82,6 +90,7 @@ class ValidationReport:
             "references_checked": self.references_checked,
             "broken_links": len(self.broken_links),
             "missing_assets": len(self.missing_assets),
+            "case_mismatches": len(self.case_mismatches),
             "external_links": self.external_links,
             "console_errors": len(self.console_errors),
             "page_errors": len(self.page_errors),
@@ -181,7 +190,12 @@ def validate_output(
     all_files = list(iter_files(output_dir))
     report.total_files = len(all_files)
 
-    existing = {p.relative_to(output_dir).as_posix().lower() for p in all_files}
+    # Exact spellings, plus a lowercase index for telling "missing" apart from
+    # "spelled with different case". Comparing only lowercased paths, as this
+    # did, reports a reference to Logo.PNG against a file named logo.png as
+    # perfectly fine -- and it is, until the export reaches a Linux host.
+    existing = {p.relative_to(output_dir).as_posix() for p in all_files}
+    by_lower = {value.lower(): value for value in existing}
     referenced: set[str] = set()
 
     html_files = [p for p in all_files if p.suffix.lower() in {".html", ".htm"}][:max_files]
@@ -198,12 +212,23 @@ def validate_output(
         if resolved is None:
             return  # anchor, data: URI or other non-file reference
         referenced.add(resolved.lower())
-        if resolved.lower() not in existing:
-            entry = BrokenReference(relative, raw, "other" if kind == "link" else kind)
-            if kind == "link":
-                report.broken_links.append(BrokenReference(relative, raw, "link"))
-            else:
-                report.missing_assets.append(entry)
+        if resolved in existing:
+            return
+
+        actual = by_lower.get(resolved.lower())
+        if actual is not None:
+            # The file is there under another spelling: a link that works on
+            # this machine and breaks on the server the site is going to.
+            report.case_mismatches.append(
+                BrokenReference(relative, raw, "case", f"the file is {actual}")
+            )
+            return
+
+        entry = BrokenReference(relative, raw, "other" if kind == "link" else kind)
+        if kind == "link":
+            report.broken_links.append(BrokenReference(relative, raw, "link"))
+        else:
+            report.missing_assets.append(entry)
 
     jobs = [
         (_scan_html, [(str(p), p.relative_to(output_dir).as_posix()) for p in html_files]),
@@ -221,9 +246,11 @@ def validate_output(
                 resolve(relative, raw, kind)
 
     logger.info(
-        "static validation: %d HTML files, %d references, %d broken links, %d missing assets",
+        "static validation: %d HTML files, %d references, %d broken links, "
+        "%d missing assets, %d case mismatches",
         report.html_files, report.references_checked,
         len(report.broken_links), len(report.missing_assets),
+        len(report.case_mismatches),
     )
     return report
 
@@ -233,9 +260,19 @@ def _run_scan(scan, items: list[tuple[str, str]], workers: int):
     if workers <= 1 or len(items) < 40:
         return [scan(item) for item in items]
     try:
+        import multiprocessing
         from concurrent.futures import ProcessPoolExecutor
 
-        with ProcessPoolExecutor(max_workers=workers) as pool:
+        # "spawn" explicitly, because POSIX defaults to "fork" and this runs
+        # from a thread while Playwright, the job's thread pool and the logging
+        # lock are all live. A fork copies those locks in whatever state they
+        # happen to be in, and a child that inherits a held logging lock
+        # deadlocks the first time it logs -- silently, with the job stuck in
+        # "Validating" forever. Windows has always spawned; this makes both
+        # platforms do the same thing, so what passes here passes there.
+        context = multiprocessing.get_context("spawn")
+
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
             return list(pool.map(scan, items, chunksize=8))
     except Exception as exc:
         # A sandbox that forbids subprocesses, or a spawn failure: checking the

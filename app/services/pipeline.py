@@ -1669,9 +1669,31 @@ class ConversionPipeline:
                 "VALIDATE",
                 f"checked {validation.references_checked:,} references: "
                 f"{validation.broken_link_count} broken link(s), "
-                f"{validation.missing_asset_count} missing asset(s)",
+                f"{validation.missing_asset_count} missing asset(s), "
+                f"{len(validation.case_mismatches)} case mismatch(es)",
                 "INFO" if validation.is_clean else "WARN",
             )
+            if validation.case_mismatches:
+                # Worth its own message: these resolve on Windows and 404 on
+                # the Linux host the export is going to, so a clean-looking
+                # conversion would ship broken images.
+                examples = ", ".join(
+                    f"{m.source_file}: {m.reference} ({m.reason})"
+                    for m in validation.case_mismatches[:3]
+                )
+                self._stage_failures.append({
+                    "kind": "case-mismatch",
+                    "message": (
+                        f"{len(validation.case_mismatches)} reference(s) differ from the "
+                        "file's name only in capitalisation. They work on Windows and "
+                        "will 404 on a Linux web server."
+                    ),
+                    "examples": [
+                        f"{m.source_file}: {m.reference} ({m.reason})"
+                        for m in validation.case_mismatches[:10]
+                    ],
+                })
+                self._log("QUALITY", f"case mismatches: {examples}", "WARN")
 
         if self.options.check_console_errors:
             self._progress("Loading representative pages in a browser", 0.25)
