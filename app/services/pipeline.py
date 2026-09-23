@@ -45,7 +45,7 @@ from app.services import quality
 from app.services.quality import template_signature
 from app.services.url_rewriter import AssetMap
 from app.utils import capacity
-from app.utils.urls import host_variants, is_local_origin
+from app.utils.urls import host_variants, is_local_origin, is_raw_document
 from app.services.visual_validator import VisualValidator, summarise as summarise_visual
 from app.services.wordpress_runner import MysqlServer, PhpServerPool, find_free_port
 from app.services.wpress_extractor import WpressError, get_extractor
@@ -518,6 +518,21 @@ class ConversionPipeline:
                 # Stopped before its first page, possibly partway through the
                 # URL rewrite. Finish the restore; every step is repeatable.
                 self._finish_restore(mysql, previous_local, port)
+            else:
+                # Pages are already captured, so the URL rewrite and the
+                # activation repair are done. The export settings are not
+                # necessarily: a resume is how a job picks up a fix made since
+                # it ran, and one of those settings decides whether Elementor
+                # keeps a page's CSS in a file that may be missing. Applying
+                # them again is cheap and idempotent -- and without it,
+                # --rerender would re-render the pages exactly as wrongly as
+                # the first time.
+                self._record_restore_notes(
+                    restorer.configure_for_static_export(
+                        mysql, context.database, context.table_prefix, context.base_url
+                    ),
+                    "RESUME",
+                )
 
             self._verify_core()
             self._verify_content(archive)
@@ -2189,11 +2204,12 @@ def _is_raw_document(url: str) -> bool:
     returns the HTML of its own built-in XML viewer. Capturing a sitemap that
     way would replace valid XML with a page of viewer markup, so these are
     fetched over plain HTTP and written through unchanged.
-    """
-    import posixpath
 
-    extension = posixpath.splitext(urlsplit(url).path)[1].lower()
-    return extension in {".xml", ".xsl", ".xslt", ".txt", ".json", ".rss", ".atom", ".webmanifest"}
+    The list of extensions lives with the other URL rules, so discovery and
+    rendering cannot disagree about what a document is -- two copies of one
+    rule is how mariadb-dump ended up being looked for in the wrong place.
+    """
+    return is_raw_document(url)
 
 
 def _short(url: str, base_url: str) -> str:

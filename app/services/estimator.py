@@ -215,6 +215,16 @@ def estimate(machine: Machine, work: Workload) -> Estimate:
     parallel, per_job, limits = size_batch(
         capacity, free_disk, largest, work.parallel, work.pages_at_once
     )
+    # You cannot run four conversions at once when there is one backup. Without
+    # this, a single site on a big machine was given a quarter of the page
+    # budget and predicted far slower than it would really be -- the sharing
+    # rule applied to a job with nobody to share with.
+    capped_by_count = False
+    if not work.parallel and work.sites and parallel > work.sites:
+        parallel, per_job, limits = size_batch(
+            capacity, free_disk, largest, work.sites, work.pages_at_once
+        )
+        capped_by_count = True
 
     speed = max(0.1, work.cpu_speed)
     render = work.pages_per_site * work.seconds_per_page / per_job / 60 / speed
@@ -236,6 +246,8 @@ def estimate(machine: Machine, work: Workload) -> Estimate:
     smallest = min(limits["cpu"], limits["memory"], limits["disk"])
     if work.parallel:
         limit = f"set by hand to {work.parallel}"
+    elif capped_by_count:
+        limit = f"only {work.sites} backup(s) to convert"
     elif limits["cpu"] == smallest:
         limit = "limited by CPU cores"
     elif limits["memory"] == smallest:

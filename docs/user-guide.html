@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>WordPress to Static HTML — Command Guide</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm 16mm; }
+
+  :root {
+    --ink: #16202c;
+    --muted: #5a6879;
+    --line: #dfe4ec;
+    --accent: #1f5fbf;
+    --accent-soft: #eef4fd;
+    --warn-bg: #fdf6e6;
+    --warn-line: #f0dfb4;
+    --warn-ink: #8a5a00;
+    --code-bg: #f5f7fa;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font: 10.5pt/1.55 "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink);
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+
+  h1 { font-size: 22pt; margin: 0 0 4pt; letter-spacing: -.3pt; }
+  h2 {
+    font-size: 13pt; margin: 20pt 0 7pt; padding-bottom: 4pt;
+    border-bottom: 1.5px solid var(--accent); color: var(--accent);
+    page-break-after: avoid;
+  }
+  h3 { font-size: 11pt; margin: 13pt 0 5pt; page-break-after: avoid; }
+  p { margin: 0 0 7pt; }
+
+  .lede { color: var(--muted); font-size: 11pt; margin-bottom: 2pt; }
+  .meta { color: var(--muted); font-size: 8.5pt; margin-bottom: 14pt; }
+
+  code, pre { font-family: "Cascadia Mono", Consolas, "Courier New", monospace; }
+  code { background: var(--code-bg); padding: 1px 4px; border-radius: 3px; font-size: 9.2pt; }
+  pre {
+    background: var(--code-bg); border: 1px solid var(--line); border-left: 3px solid var(--accent);
+    border-radius: 4px; padding: 8pt 10pt; margin: 0 0 9pt;
+    font-size: 9pt; line-height: 1.45; white-space: pre-wrap; word-break: break-word;
+    page-break-inside: avoid;
+  }
+  pre code { background: none; padding: 0; font-size: inherit; }
+
+  table { width: 100%; border-collapse: collapse; margin: 0 0 10pt; font-size: 9.3pt;
+          page-break-inside: avoid; }
+  th, td { text-align: left; padding: 4.5pt 7pt; border-bottom: 1px solid var(--line);
+           vertical-align: top; }
+  th { background: var(--accent-soft); font-weight: 600; }
+  td code { font-size: 8.8pt; white-space: nowrap; }
+
+  .note {
+    background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 4px;
+    padding: 7pt 10pt; margin: 0 0 10pt; color: var(--warn-ink); font-size: 9.5pt;
+    page-break-inside: avoid;
+  }
+  .note strong { color: var(--warn-ink); }
+
+  .cols { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16pt; }
+  .muted { color: var(--muted); }
+  .small { font-size: 9pt; }
+  ul { margin: 0 0 8pt; padding-left: 16pt; }
+  li { margin-bottom: 3pt; }
+  footer { margin-top: 18pt; padding-top: 7pt; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: 8.5pt; }
+  .break { page-break-before: always; }
+</style>
+</head>
+<body>
+
+<h1>WordPress&nbsp;→&nbsp;Static HTML</h1>
+<p class="lede">Command guide for converting All-in-One WP Migration backups into deployable static sites.</p>
+<p class="meta">For whoever runs conversions on this machine · generated from <code>docs/user-guide.html</code></p>
+
+<h2>Quick start</h2>
+
+<h3>The web interface</h3>
+<pre><code>.venv\Scripts\python.exe app.py</code></pre>
+<p>Then open <code>http://127.0.0.1:8000</code>. Pick a backup, or tick several and press
+<strong>Convert N backups</strong>. The <strong>Calculate time</strong> button estimates a batch before you commit to it.</p>
+
+<h3>One site from the terminal</h3>
+<pre><code>.venv\Scripts\python.exe convert.py C:\bkp\site.wpress -o C:\wpsc-jobs\exports</code></pre>
+
+<h3>Every backup in a folder</h3>
+<pre><code>.venv\Scripts\python.exe run_batch.py C:\bkp -o C:\wpsc-jobs\exports</code></pre>
+<p>It sizes itself from this machine's cores, memory and free disk, runs several conversions at
+once, refills each slot as a site finishes, and writes <code>summary.csv</code> beside the ZIPs.</p>
+
+<h2>Where everything goes</h2>
+<table>
+  <tr><th>What</th><th>Where</th></tr>
+  <tr><td>Finished ZIPs</td><td><code>C:\wpsc-jobs\exports\&lt;site&gt;-static-&lt;date&gt;-&lt;time&gt;.zip</code></td></tr>
+  <tr><td>Job workspace</td><td><code>C:\wpsc-jobs\&lt;job-id&gt;\</code></td></tr>
+  <tr><td>Report</td><td><code>&lt;job-id&gt;\report\conversion-report.html</code></td></tr>
+  <tr><td>Log</td><td><code>&lt;job-id&gt;\logs\job-&lt;job-id&gt;.log</code></td></tr>
+  <tr><td>Screenshots and diffs</td><td><code>&lt;job-id&gt;\screenshots\</code></td></tr>
+  <tr><td>Batch summary</td><td><code>&lt;exports&gt;\summary.csv</code></td></tr>
+</table>
+<p class="small">The ZIP is hard-linked into <code>exports\</code>, so it costs no extra disk and
+survives deleting the workspace. Each run's date and time are in the name, so converting the same
+backup twice never overwrites the first result.</p>
+
+<h2>Batch options</h2>
+<table>
+  <tr><th>Option</th><th>What it does</th></tr>
+  <tr><td><code>--parallel N</code></td><td>Conversions at once. Default: measured from the machine.</td></tr>
+  <tr><td><code>--pages N</code></td><td>Pages each conversion renders at once. Default: the machine's page budget divided between them.</td></tr>
+  <tr><td><code>--retry</code></td><td>Convert sites that already have a ZIP again.</td></tr>
+  <tr><td><code>--no-resume</code></td><td>Start interrupted sites over rather than continuing them.</td></tr>
+  <tr><td><code>--screenshots</code></td><td>Capture and compare screenshots against the original.</td></tr>
+  <tr><td><code>--flat</code></td><td>One file per page (<code>about.html</code>) instead of a folder per page.</td></tr>
+  <tr><td><code>--file-links</code></td><td>Write links as <code>contact-us/index.html</code> rather than <code>contact-us/</code>.</td></tr>
+  <tr><td><code>--jobs-dir PATH</code></td><td>Where job workspaces are written. Needs roughly 3× the backup size per running job.</td></tr>
+</table>
+
+<h2 class="break">Stopping and continuing</h2>
+
+<h3>Stopping</h3>
+<p>From the interface, <strong>Cancel</strong> stops one conversion at its next checkpoint; the others
+carry on. <strong>Cancel remaining</strong> stops everything not yet finished. Nothing is deleted.</p>
+<p>From the terminal, <kbd>Ctrl</kbd>+<kbd>C</kbd> stops the whole batch, including the conversions
+running at that moment.</p>
+
+<h3>Continuing a stopped batch</h3>
+<pre><code>.venv\Scripts\python.exe run_batch.py C:\bkp -o C:\wpsc-jobs\exports</code></pre>
+<p>Run the same command again. Sites with a ZIP are skipped; sites that were interrupted
+<strong>continue where they stopped</strong>, skipping extraction and the database import — about half
+an hour each on a 3 GB backup. Everything else converts normally.</p>
+<pre><code>20 backup(s); 16 to convert, 4 already done
+4 stopped part-way and will continue where they left off</code></pre>
+
+<h3>Continuing one site</h3>
+<pre><code>.venv\Scripts\python.exe convert.py --resume &lt;job-id&gt; --rerender --resume-port &lt;port&gt; -o C:\wpsc-jobs\exports</code></pre>
+<p>The job id and port are in that job's log, on the line reading
+<code>WordPress is serving on http://127.0.0.1:&lt;port&gt;</code>. The port matters because captured pages
+hold absolute URLs to the port they were rendered against.</p>
+
+<div class="note">
+<strong>A site that failed is not resumed automatically.</strong> It stopped because something went
+wrong, and reusing the half-built result is unlikely to give a different answer, so the batch starts
+it over. Only interrupted work — cancelled, or still running when the process stopped — is continued.
+</div>
+
+<h3>Starting over instead of continuing</h3>
+<p>The same command behaves differently because it reads what is on disk, not because it remembers
+anything. Two flags override that.</p>
+
+<table>
+  <tr><th>Command</th><th>What it does</th></tr>
+  <tr>
+    <td><code>--no-resume</code></td>
+    <td>Interrupted sites start from the beginning. Sites that already have a ZIP are still skipped.</td>
+  </tr>
+  <tr>
+    <td><code>--retry</code></td>
+    <td>Sites that already have a ZIP are converted again. Implies <code>--no-resume</code>, because
+        redoing finished work and continuing old work are contradictory.</td>
+  </tr>
+  <tr>
+    <td><code>--retry --no-resume</code></td>
+    <td>A complete restart: every backup in the folder converted from scratch, nothing skipped,
+        nothing reused.</td>
+  </tr>
+</table>
+
+<p><strong>Redo the interrupted sites properly, keep the finished ones:</strong></p>
+<pre><code>.venv\Scripts\python.exe run_batch.py C:\bkp -o C:\wpsc-jobs\exports --no-resume</code></pre>
+
+<p><strong>Convert everything again, from the beginning:</strong></p>
+<pre><code>.venv\Scripts\python.exe run_batch.py C:\bkp -o C:\wpsc-jobs\exports --retry --no-resume</code></pre>
+
+<p><strong>Redo one site only:</strong> delete its ZIP from <code>exports\</code> and run the ordinary
+command. With no ZIP and no workspace it converts from scratch; with a workspace still present it
+would resume, so delete that too if you want it truly fresh.</p>
+<pre><code>del C:\wpsc-jobs\exports\site-static-*.zip
+rmdir /s /q C:\wpsc-jobs\&lt;job-id&gt;
+.venv\Scripts\python.exe run_batch.py C:\bkp -o C:\wpsc-jobs\exports</code></pre>
+
+<div class="note">
+<strong>Prefer a complete restart after a fix to the restore.</strong> A resume reuses the database
+and the extracted files, so a change to how the site is restored — a plugin setting, a theme repair —
+only takes effect on a fresh conversion. A change to rendering or to the export is picked up by a
+resume, because those stages run again either way.
+</div>
+
+<h2>Reading the result</h2>
+<p><code>summary.csv</code> has one row per site: pages, problems, source issues, visual score, minutes
+and ZIP path. Sort by <code>problems</code> and look only at the rows that need you.</p>
+<table>
+  <tr><th>In the report</th><th>Means</th></tr>
+  <tr><td><strong>Problems</strong></td><td>Faults in the export. These need attention.</td></tr>
+  <tr><td><strong>Source issues</strong></td><td>Faults in the original site that the export reproduces faithfully — broken images, dead links. Not your problem to fix here.</td></tr>
+  <tr><td><strong>Case mismatches</strong></td><td>A link whose capitalisation differs from the file's. Works on Windows, 404s on a Linux host.</td></tr>
+  <tr><td><strong>Visual similarity</strong></td><td>Sampled pages compared against the original. Below ~95% on Linux usually means missing fonts.</td></tr>
+  <tr><td><strong>Needs a server</strong></td><td>Forms, search, comments and AJAX. Preserved visually; they cannot function without PHP.</td></tr>
+</table>
+
+<h2>Checking the export yourself</h2>
+<pre><code>cd C:\wpsc-jobs\&lt;job-id&gt;\output
+python -m http.server 8080</code></pre>
+<p>Then open <code>http://localhost:8080/</code>. Open the site this way, not by double-clicking
+<code>index.html</code> — browsers apply much stricter rules to <code>file://</code> pages, and a perfectly
+good export can look broken.</p>
+
+<h2>Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Cause and fix</th></tr>
+  <tr><td>"not enough free space"</td><td>A conversion needs about 3× the backup. Free space, or point <code>--jobs-dir</code> at a bigger disk.</td></tr>
+  <tr><td>A job fails part-way with a disk error</td><td>Free space fell below what the run needed. The batch checks up front, but other programs consume disk too.</td></tr>
+  <tr><td>Pages look unstyled</td><td>Open the site over HTTP, not <code>file://</code>. If it persists, check the report for missing stylesheets.</td></tr>
+  <tr><td>Conversion is slow</td><td>Close other heavy programs. On a 2-core machine an editor and a browser are direct competition for the conversion.</td></tr>
+  <tr><td>Dependencies missing</td><td><code>.venv\Scripts\python.exe scripts\doctor.py</code> checks PHP, MariaDB and Chromium and says what to install.</td></tr>
+</table>
+
+<h2>On a Linux server</h2>
+<pre><code>sudo ./setup.sh
+.venv/bin/python scripts/doctor.py
+.venv/bin/python -m pytest -q -m integration
+.venv/bin/python run_batch.py /srv/backups -o /srv/exports</code></pre>
+<p>Run it under <code>tmux</code> so closing the terminal cannot stop it. Ubuntu 24.04 is required —
+22.04 ships Python 3.10 and cannot run this. Full detail, including the verification checklist,
+is in <code>docs/LINUX.md</code>.</p>
+
+<div class="note">
+<strong>Convert one site before trusting a batch of twenty.</strong> Read its report and open the
+exported site. Twenty sites converted wrongly is twenty sites to convert again.
+</div>
+
+<footer>
+Every conversion restores the backup into a temporary, loopback-only WordPress, renders each page in
+a real browser, and destroys the temporary site afterwards. Nothing is uploaded, and the original
+backup is never modified.
+</footer>
+
+</body>
+</html>

@@ -33,7 +33,13 @@ import httpx
 
 from app.config import ConversionOptions
 from app.models.job import UrlRecord
-from app.utils.urls import ResourceClass, classify_url, normalise_url, to_local_origin
+from app.utils.urls import (
+    ResourceClass,
+    classify_url,
+    is_renderable,
+    normalise_url,
+    to_local_origin,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -565,6 +571,14 @@ def filter_discovered_links(
         if not url:
             continue
         if classify_url(url, site_hosts) is not ResourceClass.LOCAL:
+            continue
+
+        # A link to a PDF or an image is a link to a file, not to a page.
+        # Chromium cannot render either -- it starts a download for one and
+        # shows its own viewer for the other -- and both are collected as
+        # assets anyway when a page references them. Sitemaps, feeds and
+        # robots.txt are excepted: those are documents of the site.
+        if not is_renderable(url):
             continue
 
         # A page of ours, but the markup may address it by the live domain --

@@ -2124,6 +2124,65 @@ def configure_for_static_export(server, database: str, table_prefix: str, site_u
 
     set_option(server, database, table_prefix, "blog_public", "1")
 
+    # Make Elementor write its CSS into the page instead of into files.
+    #
+    # By default it keeps each page's styles in
+    # wp-content/uploads/elementor/css/post-N.css and generates them on demand.
+    # A backup taken after that cache was cleared contains none of them, and
+    # the ones it never regenerates -- theme-builder templates, in particular --
+    # are requested by the browser and answered with WordPress's "not found"
+    # page. What reaches the export is a stylesheet-shaped file full of HTML,
+    # and the page silently loses its layout: on one real site the home page
+    # lost its hero background entirely, scoring 91% against the original for
+    # no reason the report could name.
+    #
+    # Printing the CSS inline removes the whole class of problem: the styles
+    # are in the DOM the renderer captures, so there is no file to miss. It
+    # costs some duplication between pages, which compresses away in the ZIP.
+    set_option(server, database, table_prefix, "elementor_css_print_method", "internal")
+
+    # And clear Elementor's record of what it has already generated.
+    #
+    # Setting the print method alone was not enough: each post carries an
+    # ``_elementor_css`` meta saying "this page's stylesheet exists and is
+    # current", and while that is there Elementor enqueues the file rather
+    # than printing anything. The file, meanwhile, was never in the backup --
+    # uploads/elementor/css is a cache, and a backup taken after it was
+    # cleared contains none of it. The database claimed a file that did not
+    # exist, so nothing regenerated it and nothing reported it missing.
+    #
+    # Deleting the record is what the "Regenerate CSS" button in Elementor's
+    # own settings does. With it gone and the print method internal, the
+    # styles are rebuilt into the page that needs them.
+    cleared = 0
+    try:
+        with server.connect(database) as conn, conn.cursor() as cur:
+            cur.execute(
+                f"DELETE FROM `{table_prefix}postmeta` WHERE meta_key = %s", ("_elementor_css",)
+            )
+            cleared = cur.rowcount or 0
+            cur.execute(
+                f"DELETE FROM `{table_prefix}options` WHERE option_name IN (%s, %s)",
+                ("_elementor_global_css", "elementor_global_css"),
+            )
+    except Exception as exc:
+        # A site without Elementor has no such rows, and a site with a
+        # different schema is not worth failing a restore over.
+        logger.debug("could not clear Elementor's CSS cache: %s", exc)
+
+    if cleared:
+        notes.append(
+            f"Cleared Elementor's record of {cleared} generated stylesheet(s) and set it "
+            "to print CSS into each page, so a page cannot lose its styling to a "
+            "stylesheet the backup does not contain."
+        )
+    else:
+        notes.append(
+            "Elementor now prints its CSS into each page rather than into separate "
+            "files, so a page cannot lose its styling to a stylesheet the backup "
+            "does not contain."
+        )
+
     # Drop the cached rewrite rules. They were generated on the source host and
     # can be stale in two ways that both produce 404s during the crawl: they
     # may encode the old domain's structure, and they may pre-date a custom

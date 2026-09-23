@@ -40,6 +40,8 @@ __all__ = [
     "url_to_output_path",
     "relative_href",
     "is_probably_asset",
+    "is_raw_document",
+    "is_renderable",
     "strip_tracking_params",
     "split_srcset",
     "join_srcset",
@@ -113,6 +115,14 @@ ASSET_EXTENSIONS = frozenset({
 
 DOCUMENT_EXTENSIONS = frozenset({
     ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".zip", ".csv",
+})
+
+#: Fetched byte-for-byte and written through unchanged, rather than rendered.
+#: These belong to the site rather than to a page -- a sitemap, a feed,
+#: robots.txt -- and Chromium cannot hand them back: asked for an XML document
+#: it returns the HTML of its own built-in viewer.
+RAW_DOCUMENT_EXTENSIONS = frozenset({
+    ".xml", ".xsl", ".xslt", ".txt", ".json", ".rss", ".atom", ".webmanifest",
 })
 
 MEDIA_EXTENSIONS = frozenset({
@@ -309,6 +319,32 @@ def is_probably_asset(url: str) -> bool:
     path = urlsplit(url).path
     ext = posixpath.splitext(path)[1].lower()
     return bool(ext) and ext in ASSET_EXTENSIONS and ext not in {".php", ".html", ".htm"}
+
+
+def is_raw_document(url: str) -> bool:
+    """Whether the URL is copied byte-for-byte rather than rendered."""
+    ext = posixpath.splitext(urlsplit(url).path)[1].lower()
+    return ext in RAW_DOCUMENT_EXTENSIONS
+
+
+def is_renderable(url: str) -> bool:
+    """Whether a browser should be pointed at this URL at all.
+
+    A link to a PDF or an image is a link to a *file*, not to a page of the
+    site. Chromium cannot render either: given a PDF it begins a download and
+    the navigation fails outright, and given an image it displays its own
+    viewer -- a black page holding one ``<img>`` -- which was then written out
+    as if it were a page of the site.
+
+    One real conversion queued 25 PDFs and 31 images this way. The PDFs failed
+    three times each and the pages linking to them were reported as broken;
+    the images became 31 pages of viewer markup. Neither needed rendering:
+    both are collected as assets when a page references them.
+
+    Sitemaps, feeds and robots.txt are the exception. They are not assets of a
+    page but documents of the site, and are fetched and written through.
+    """
+    return is_raw_document(url) or not is_probably_asset(url)
 
 
 def guess_extension(url: str, content_type: str | None = None) -> str:

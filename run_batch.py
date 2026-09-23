@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -154,6 +155,76 @@ def plan_batch(machine: Capacity, jobs_dir: Path, backups: list[Path],
                 free_disk=free, largest_backup=largest, requested=bool(requested))
 
 
+@dataclass
+class Restart:
+    """An interrupted conversion that can carry on instead of starting again."""
+
+    job_id: str
+    port: int
+    stage: str
+    pages: int
+
+    def describe(self) -> str:
+        where = f"{self.pages} page(s) already rendered" if self.pages else f"stopped in {self.stage}"
+        return f"resuming {self.job_id} ({where})"
+
+
+#: Statuses worth continuing. A FAILED job is left out on purpose: it stopped
+#: because something went wrong, and reusing the half-built result is the least
+#: likely way to get a different answer. Interrupted work, by contrast, is
+#: simply unfinished -- an extracted WordPress and an imported database that
+#: cost half an hour and are still perfectly good.
+_RESUMABLE = {"CANCELLED", "RUNNING", "EXTRACTING", "RESTORING", "STARTING_WORDPRESS",
+              "DISCOVERING_URLS", "RENDERING", "GENERATING_HTML", "DOWNLOADING_ASSETS",
+              "VALIDATING", "ZIPPING"}
+
+
+def find_restart(backup: Path, jobs_dir: Path, settings) -> Restart | None:
+    """The most recent interrupted job for *backup*, if it can be continued.
+
+    Resuming skips extraction and the database import, which on a 3 GB backup
+    is about half an hour of work already done. What makes it safe is that the
+    workspace is still there: a cancelled job keeps everything, precisely so
+    this is possible.
+    """
+    from app.models.job import JobStore
+
+    store = JobStore(settings.database_path)
+    try:
+        for job in store.list(limit=200):
+            if job.filename != backup.name:
+                continue
+            status = str(getattr(job.status, "value", job.status)).upper()
+            if status not in _RESUMABLE:
+                # COMPLETED is handled by the ZIP check; FAILED starts over.
+                continue
+            workspace = jobs_dir / job.id
+            if not (workspace / "wordpress").is_dir():
+                continue          # nothing useful survived; a fresh run is faster
+
+            rendered = workspace / "rendered"
+            pages = len(list(rendered.glob("*.html"))) if rendered.is_dir() else 0
+
+            port = 0
+            if pages:
+                # Captured pages hold absolute URLs to the port they were
+                # rendered against, so that port is fixed from then on.
+                for record in store.get_urls(job.id):
+                    match = re.match(r"https?://127\.0\.0\.1:(\d+)", record.url or "")
+                    if match:
+                        port = int(match.group(1))
+                        break
+                if not port:
+                    return None   # cannot resume safely without the right port
+
+            return Restart(job_id=job.id, port=port, stage=status.lower(), pages=pages)
+    except Exception as exc:      # a resume is an optimisation, never a requirement
+        say(f"could not check for resumable work on {backup.name}: {exc}")
+    finally:
+        store.close()
+    return None
+
+
 def find_backups(source: Path) -> list[Path]:
     if source.is_file():
         return [source]
@@ -187,24 +258,44 @@ def latest_report(jobs_dir: Path, backup: Path, started: float) -> dict:
     return newest or {}
 
 
-def convert(backup: Path, exports: Path, jobs_dir: Path, extra: list[str], log_dir: Path) -> Result:
+def convert(backup: Path, exports: Path, jobs_dir: Path, extra: list[str], log_dir: Path,
+            restart: "Restart | None" = None) -> Result:
     result = Result(backup=backup.name)
     started = time.monotonic()
     wall = time.time()
     log_file = log_dir / f"{backup.stem}.log"
 
-    command = [
-        sys.executable, str(Path(__file__).with_name("convert.py")), str(backup),
-        "--jobs-dir", str(jobs_dir), "-o", str(exports), *extra,
-    ]
+    if restart is not None:
+        # Continue the interrupted job rather than extracting and importing a
+        # second time. --rerender because a resume is usually how a site picks
+        # up a fix made since it stopped, and captured pages predate that fix.
+        result.job_id = restart.job_id
+        command = [
+            sys.executable, str(Path(__file__).with_name("convert.py")),
+            "--resume", restart.job_id, "--rerender",
+            "--archive", str(backup),
+            "--jobs-dir", str(jobs_dir), "-o", str(exports), *extra,
+        ]
+        if restart.port:
+            command += ["--resume-port", str(restart.port)]
+    else:
+        command = [
+            sys.executable, str(Path(__file__).with_name("convert.py")), str(backup),
+            "--jobs-dir", str(jobs_dir), "-o", str(exports), *extra,
+        ]
     try:
         # Inside the try: a backup that has become unreadable is this site's
         # failure, not the batch's. Left outside, it escapes future.result()
         # and ends the run with a traceback.
-        say(f"start  {backup.name} ({backup.stat().st_size / 1073741824:.2f} GB)")
+        if restart is not None:
+            say(f"resume {backup.name} -- {restart.describe()}")
+        else:
+            say(f"start  {backup.name} ({backup.stat().st_size / 1073741824:.2f} GB)")
         with log_file.open("wb") as log:
             completed = subprocess.run(command, stdout=log, stderr=subprocess.STDOUT, check=False)
         result.status = "converted" if completed.returncode == 0 else "failed"
+        if completed.returncode == 0 and restart is not None:
+            result.status = "resumed"
         result.detail = "" if completed.returncode == 0 else f"exit code {completed.returncode}"
     except Exception as exc:  # the batch continues whatever one site does
         result.status = "failed"
@@ -252,6 +343,8 @@ def main(argv: list[str] | None = None) -> int:
                              "machine's page budget divided between the conversions")
     parser.add_argument("--retry", action="store_true",
                         help="convert sites that already have a ZIP again")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="start interrupted sites over rather than continuing them")
     parser.add_argument("--flat", action="store_true", help="one file per page (about.html)")
     parser.add_argument("--file-links", action="store_true",
                         help="write links as contact-us/index.html")
@@ -272,17 +365,28 @@ def main(argv: list[str] | None = None) -> int:
         print(f"no .wpress files in {args.source}", file=sys.stderr)
         return 2
 
-    pending, skipped = [], []
+    pending: list[tuple[Path, Restart | None]] = []
+    skipped: list[Result] = []
     for backup in backups:
         existing = None if args.retry else already_done(backup, exports)
         if existing:
             skipped.append(Result(backup=backup.name, status="skipped (already converted)",
                                   zip_path=str(existing)))
-        else:
-            pending.append(backup)
+            continue
+        # A site interrupted part-way already has its WordPress extracted and
+        # its database imported: about half an hour of work on a 3 GB backup.
+        # Picking that up is what makes stopping a batch cheap instead of
+        # expensive -- stop twenty sites at the four-running mark and starting
+        # over costs two hours that the workspaces on disk have already paid.
+        restart = None if (args.no_resume or args.retry) else find_restart(
+            backup, jobs_dir, settings
+        )
+        pending.append((backup, restart))
+
+    resumable = [backup for backup, restart in pending if restart is not None]
 
     machine = measure()
-    plan = plan_batch(machine, jobs_dir, pending, args.parallel, args.pages)
+    plan = plan_batch(machine, jobs_dir, [b for b, _ in pending], args.parallel, args.pages)
 
     extra: list[str] = ["-c", str(plan.per_job)]
     if args.flat:
@@ -293,6 +397,8 @@ def main(argv: list[str] | None = None) -> int:
         extra.append("--screenshots")
 
     print(f"\n  {len(backups)} backup(s); {len(pending)} to convert, {len(skipped)} already done")
+    if resumable:
+        print(f"  {len(resumable)} stopped part-way and will continue where they left off")
     print(f"  {machine.describe()}")
     print(f"  running {plan.parallel} conversion(s) at a time, {plan.per_job} page(s) each "
           f"({plan.parallel * plan.per_job} browser page(s) in total)")
@@ -306,8 +412,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         with ThreadPoolExecutor(max_workers=plan.parallel) as pool:
             futures = {
-                pool.submit(convert, backup, exports, jobs_dir, extra, log_dir): backup
-                for backup in pending
+                pool.submit(convert, backup, exports, jobs_dir, extra, log_dir, restart): backup
+                for backup, restart in pending
             }
             for future in as_completed(futures):
                 batch.add(future.result())
@@ -317,12 +423,15 @@ def main(argv: list[str] | None = None) -> int:
 
     write_summary(exports / "summary.csv", batch.results)
 
-    done = [r for r in batch.results if r.status.startswith("converted")]
+    done = [r for r in batch.results if r.status.startswith(("converted", "resumed"))]
+    resumed = [r for r in batch.results if r.status == "resumed"]
     problems = [r for r in batch.results if r.problems]
     failed = [r for r in batch.results if r.status == "failed"]
 
     print(f"\n  finished in {(time.monotonic() - started) / 60:.0f} min: "
-          f"{len(done)} converted, {len(failed)} failed, {len(skipped)} skipped")
+          f"{len(done)} converted"
+          + (f" ({len(resumed)} resumed)" if resumed else "")
+          + f", {len(failed)} failed, {len(skipped)} skipped")
     if problems:
         print("\n  needs a look:")
         for r in problems:
